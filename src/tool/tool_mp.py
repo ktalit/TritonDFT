@@ -38,6 +38,39 @@ def _extract_list(snippet: str, key: str) -> Optional[List[Any]]:
     m = re.search(rf"{key}\s*=\s*(\[[^\]]*\])", snippet, re.DOTALL)
     if not m:
         return None
+
+
+def _normalized_symmetry_symbol(value: str) -> str:
+    return re.sub(r"[\s_]", "", str(value or "")).lower()
+
+
+def _filter_docs_by_requested_symmetry(
+    docs: List[Dict[str, Any]], *, sg_symbol: Optional[str],
+    sg_number: Optional[int], point_group: Optional[str], analyzer_cls,
+) -> List[Dict[str, Any]]:
+    """Apply phase constraints before thermodynamic ranking."""
+    if not sg_symbol and sg_number is None and not point_group:
+        return docs
+    matched = []
+    for doc in docs:
+        structure = _as_structure(doc.get("structure"))
+        if structure is None:
+            continue
+        try:
+            analyzer = analyzer_cls(structure, symprec=1e-3, angle_tolerance=5)
+            actual_symbol = analyzer.get_space_group_symbol()
+            actual_number = analyzer.get_space_group_number()
+            actual_point_group = analyzer.get_point_group_symbol()
+        except Exception:
+            continue
+        if sg_symbol and _normalized_symmetry_symbol(actual_symbol) != _normalized_symmetry_symbol(sg_symbol):
+            continue
+        if sg_number is not None and int(actual_number) != int(sg_number):
+            continue
+        if point_group and _normalized_symmetry_symbol(actual_point_group) != _normalized_symmetry_symbol(point_group):
+            continue
+        matched.append(doc)
+    return matched
     try:
         return ast.literal_eval(m.group(1))
     except Exception:
@@ -78,9 +111,11 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     elements = _extract_list(snippet, "elements")
     sg_symbol = _extract_str(snippet, "spacegroup_symbol")
     sg_number = _extract_int(snippet, "spacegroup_number")
+    point_group = _extract_str(snippet, "point_group_symbol") or _extract_str(snippet, "point_group")
     chemsys = _extract_str(snippet, "chemsys")
 
-    # Step 3. Query summary endpoint to get material_ids (avoid `limit=`; truncate locally).
+    # Step 3. Query lightweight summary records once. Include stability in this
+    # request so selection does not issue one API request per candidate.
     if not material_ids:
         with MPRester(use_document_model=False) as mpr:
             docs_iter = mpr.materials.summary.search(
@@ -89,31 +124,65 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
                 spacegroup_symbol=sg_symbol,
                 spacegroup_number=sg_number,
                 chemsys=chemsys,
-                fields=["material_id", "structure"],
+                fields=["material_id", "structure", "energy_above_hull"],
             )
-            docs = list(docs_iter)[:limit]
-        material_ids = [d["material_id"] for d in docs]
-        relaxed_lookup = {d["material_id"]: _as_structure(d["structure"]) for d in docs}
+            docs = list(docs_iter)
     else:
         with MPRester(use_document_model=False) as mpr:
             docs_iter = mpr.materials.summary.search(
                 material_ids=material_ids,
-                fields=["material_id", "structure"],
+                fields=["material_id", "structure", "energy_above_hull"],
             )
             docs = list(docs_iter)
-        relaxed_lookup = {d["material_id"]: _as_structure(d["structure"]) for d in docs}
 
-    if not material_ids:
+    if not docs:
         return {}
 
-    # Step 4. Query materials endpoint for initial_structures.
+    symmetry_docs = _filter_docs_by_requested_symmetry(
+        docs, sg_symbol=sg_symbol, sg_number=sg_number, point_group=point_group,
+        analyzer_cls=SpacegroupAnalyzer,
+    )
+    if (sg_symbol or sg_number is not None or point_group) and not symmetry_docs:
+        requested = (
+            sg_symbol if sg_symbol else
+            f"space-group number {sg_number}" if sg_number is not None else
+            f"point group {point_group}"
+        )
+        raise ValueError(
+            f"Materials Project returned no structure matching the explicitly requested {requested}. "
+            "TritonDFT will not substitute a different polymorph."
+        )
+    docs = symmetry_docs or docs
+
+    # Within the requested phase, stable (zero-hull) entries naturally rank
+    # first; if none is stable, the lowest positive hull energy wins. Use the
+    # material id as a deterministic tie breaker when several polymorphs have
+    # the same hull energy. A supplied space-group filter has already narrowed
+    # the candidate set at the API level.
+    ranked_docs = sorted(
+        docs,
+        key=lambda doc: (
+            float("inf") if doc.get("energy_above_hull") is None
+            else float(doc["energy_above_hull"]),
+            str(doc.get("material_id", "")),
+        ),
+    )
+    selected_doc = ranked_docs[0]
+    min_id = selected_doc["material_id"]
+    ehull_min = (
+        float(selected_doc["energy_above_hull"])
+        if selected_doc.get("energy_above_hull") is not None else float("inf")
+    )
+    retrieved_structure = _as_structure(selected_doc.get("structure"))
+
+    # Step 4. Fetch initial-structure history only for the selected record.
     # use_document_model=False -> raw dicts, bypassing emmet-core's MPID
     # validation. The live MP API now returns alias ids like "mp-aaaaaaft"
     # that fail the strict MPID regex in every emmet-core version, raising
     # "Invalid MPID Format" and killing the whole query. Raw dicts avoid it.
     with MPRester(use_document_model=False) as mpr:
         mats_iter = mpr.materials.search(
-            material_ids=material_ids,
+            material_ids=[min_id],
             fields=["material_id", "initial_structures"],
         )
         mats = list(mats_iter)
@@ -127,39 +196,10 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
         "primitive_structure": [],
     }
 
-    mats_by_id = {m["material_id"]: m for m in mats}
-
-    ehull_min = float("inf")
-    min_id = None
-    min_subid = None
-    init_list = {}
-    for mid in material_ids:
-        mdoc = mats_by_id.get(mid)
-
-        # extract initial structures
-        if mdoc and mdoc.get("initial_structures"):
-            init_list[mid] = [_as_structure(e).to(fmt="cif") for e in mdoc["initial_structures"]]
-
-        with MPRester(use_document_model=False) as mpr:
-            docs_iter = mpr.materials.summary.search(
-                material_ids=[mid],
-                fields=[
-                    "energy_above_hull",
-                ],
-            )
-            docs = list(docs_iter)
-
-            for i, doc in enumerate(docs):
-                if doc["energy_above_hull"] < ehull_min:
-                    ehull_min = doc["energy_above_hull"]
-                    min_id = mid
-                    min_subid = i
-                    # print(f"New min ehull: {ehull_min} for {min_id} (subid {min_subid})")
-
-    if min_id is None and material_ids:
-        min_id = material_ids[0]
-        min_subid = 0
-    retrieved_structure = relaxed_lookup.get(min_id)
+    mdoc = next((item for item in mats if item.get("material_id") == min_id), None)
+    available_initials = []
+    if mdoc and mdoc.get("initial_structures"):
+        available_initials = [_as_structure(item) for item in mdoc["initial_structures"]]
     if retrieved_structure is None:
         raise ValueError("Materials Project returned records but no usable periodic structure.")
     # 使用 SpacegroupAnalyzer 进行标准化处理
@@ -179,10 +219,8 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     # Some MP records do not expose an initial-structure history. The summary
     # endpoint structure is still a valid database starting geometry and must
     # keep the workflow usable rather than raising KeyError here.
-    available_initials = init_list.get(min_id) or []
     if available_initials:
-        selected_index = min(min_subid or 0, len(available_initials) - 1)
-        result["initial_structures"].append(available_initials[selected_index])
+        result["initial_structures"].append(available_initials[0].to(fmt="cif"))
     else:
         result["initial_structures"].append(retrieved_structure.to(fmt="cif"))
     result["relaxed_structures"].append(retrieved_structure)

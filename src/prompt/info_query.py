@@ -4,6 +4,9 @@ api_call_prompt = {
 
     Your goal: Given a natural-language query about a material, **output exactly one line of Python code (no surrounding quotes)**
     that calls `mpr.materials.search()` to retrieve its `initial_structures`, using `formula` and `spacegroup_symbol` if available.
+    If the user specifies only a crystallographic point group, include it as
+    `point_group_symbol` in the generated line; TritonDFT applies that filter
+    locally before selecting a Materials Project record.
 
     The output must be in **exactly one line**, no explanations or comments.
 

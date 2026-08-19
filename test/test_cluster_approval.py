@@ -46,6 +46,7 @@ from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce
 from execute_code.slurm_template import render_slurm_script
 from DFTAgent import DFTAgent, _generate_nonempty_text, _generate_valid_json
 from workflow_state import WorkflowCheckpoint, create_checkpoint
+from tool.tool_mp import fetch_material_info_from_api_snippet, _filter_docs_by_requested_symmetry
 
 
 PW_INPUT = """&control
@@ -90,6 +91,67 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_material_lookup_ranks_once_then_fetches_only_selected_history(self):
+        from pymatgen.core import Lattice, Structure
+
+        structure = Structure(Lattice.cubic(5.4), ["Si", "Si"], [[0, 0, 0], [.25, .25, .25]])
+
+        class Endpoint:
+            def __init__(self, kind, calls):
+                self.kind, self.calls = kind, calls
+
+            def search(self, **kwargs):
+                self.calls.append((self.kind, kwargs))
+                if self.kind == "summary":
+                    return [
+                        {"material_id": "mp-2", "structure": structure, "energy_above_hull": 0.2},
+                        {"material_id": "mp-1", "structure": structure, "energy_above_hull": 0.0},
+                    ]
+                self.assert_selected(kwargs)
+                return [{"material_id": "mp-1", "initial_structures": [structure]}]
+
+            @staticmethod
+            def assert_selected(kwargs):
+                if kwargs.get("material_ids") != ["mp-1"]:
+                    raise AssertionError(f"Expected only selected material, got {kwargs}")
+
+        calls = []
+
+        class FakeMPRester:
+            def __init__(self, **_kwargs):
+                summary = Endpoint("summary", calls)
+                self.materials = types.SimpleNamespace(summary=summary)
+                self.materials.search = Endpoint("materials", calls).search
+
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        with patch("mp_api.client.MPRester", FakeMPRester):
+            result = fetch_material_info_from_api_snippet('mpr.materials.search(formula="Si")')
+        self.assertEqual(result["material_ids"], ["mp-1"])
+        self.assertEqual(result["summary"]["energy_above_hull"], 0.0)
+        self.assertEqual([kind for kind, _ in calls], ["summary", "materials"])
+
+    def test_material_lookup_filters_symmetry_before_hull_ranking(self):
+        from pymatgen.core import Lattice, Structure
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+        rhombohedral = Structure(
+            Lattice.cubic(5.4), ["Si", "Si"], [[0, 0, 0], [.25, .25, .25]]
+        )
+        triclinic = Structure(
+            Lattice.from_parameters(4.1, 5.2, 6.3, 77, 83, 71), ["Si"], [[.13, .27, .39]]
+        )
+        docs = [
+            {"material_id": "stable-wrong-phase", "structure": triclinic, "energy_above_hull": 0.0},
+            {"material_id": "matching-phase", "structure": rhombohedral, "energy_above_hull": 0.1},
+        ]
+        matched = _filter_docs_by_requested_symmetry(
+            docs, sg_symbol=None, sg_number=None, point_group="-3m",
+            analyzer_cls=SpacegroupAnalyzer,
+        )
+        self.assertEqual([doc["material_id"] for doc in matched], ["matching-phase"])
+
     def test_admin_environment_can_supply_keys_without_user_env_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = str(Path(tmp) / ".env.cluster")
