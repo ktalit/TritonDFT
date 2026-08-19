@@ -11,6 +11,8 @@ install-checkpoints/
 .env.cluster
 .env.cluster_admin
 tmp
+local/VESTA/
+downloads/VESTA-*
 
 # Secret-bearing local files — NEVER commit these.
 env_setup.sh

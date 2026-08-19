@@ -429,7 +429,12 @@ def _find_vesta(run_dir: Path) -> str:
             Path(os.environ.get("LOCALAPPDATA", "")) / "VESTA" / "VESTA.exe",
         ]
     else:
-        candidates = [Path("/usr/bin/VESTA"), Path("/usr/local/bin/VESTA")]
+        repository_root = Path(__file__).resolve().parents[1]
+        candidates = [
+            repository_root / "local" / "VESTA",
+            Path("/usr/bin/VESTA"),
+            Path("/usr/local/bin/VESTA"),
+        ]
     for path in candidates:
         resolved = _resolve_vesta_location(path)
         if resolved:

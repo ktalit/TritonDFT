@@ -265,6 +265,21 @@ installation log.
 
 ## 8. Configure `.env.cluster`
 
+### Optional repository-local VESTA installation
+
+On a Linux x86_64 cluster, review the VESTA license and install the official
+stable archive without committing its distributed files:
+
+```bash
+cd /opt/tritondft/TritonDFT
+bash scripts/install_vesta_linux.sh --accept-license
+```
+
+The files are installed under `local/VESTA/`, which is ignored by Git, and the
+workflow dashboard discovers that executable automatically. Connect with
+trusted X forwarding (`ssh -Y`) to open the graphical viewer. VESTA requires
+GTK 3 and OpenGL libraries supplied by the cluster operating system.
+
 ### Optional central workshop configuration
 
 An administrator can provide shared defaults at
