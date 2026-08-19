@@ -1852,6 +1852,47 @@ def _parse_resume_command(query: str) -> tuple[str, Optional[int]]:
     return selection, step_id
 
 
+_DFT_CALCULATION_ACTION_RE = re.compile(
+    r"\b(?:calculate|compute|run|perform|simulate|model|optimi[sz]e|relax|"
+    r"converge|evaluate|determine|generate|obtain|predict|study|analy[sz]e)\b",
+    re.IGNORECASE,
+)
+_DFT_CALCULATION_TARGET_RE = re.compile(
+    r"\b(?:dft|density functional|scf|nscf|vc[\s_-]*relax|relax(?:ation|ed structure)?|"
+    r"lattice parameters?|band(?:\s+structure|\s+gap)?|"
+    r"dos|pdos|density of states|phonon|raman|infrared|ir[-\s]+active|elastic|"
+    r"dielectric|magnetic moment|total energ|formation energ|fermi|quantum espresso|"
+    r"pw\.x|ph\.x|bands\.x|dos\.x|projwfc\.x|vasp)\b",
+    re.IGNORECASE,
+)
+_DFT_IMPLICIT_REQUEST_RE = re.compile(
+    r"\b(?:band(?:\s+structure|\s+gap)?|dos|pdos|density of states|phonon|raman|"
+    r"relax(?:ation|ed structure)?|lattice parameters?|magnetic moments?|"
+    r"total energ(?:y|ies))\b.{0,40}\b(?:for|of|in)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_dft_calculation_request(query: str) -> bool:
+    """Return whether free text asks TritonDFT to perform a calculation."""
+    text = " ".join(str(query).split())
+    if not text:
+        return False
+    if _DFT_CALCULATION_ACTION_RE.search(text) and _DFT_CALCULATION_TARGET_RE.search(text):
+        return True
+    return bool(_DFT_IMPLICIT_REQUEST_RE.search(text))
+
+
+def _print_non_calculation_guidance() -> None:
+    print(
+        "[DFT request] This prompt starts DFT calculations and manages saved "
+        "TritonDFT workflows; it is not a general-purpose chatbot.\n"
+        "For general questions, please use ChatGPT, Gemini, Claude, or another "
+        "chat assistant. To start here, ask for a calculation—for example: "
+        "'Calculate the relaxed structure and band structure of bulk silicon.'"
+    )
+
+
 class RemoteClusterDFTAgent:
     """
     Orchestrates DFTAgent generation locally and QE execution remotely.
@@ -3687,6 +3728,9 @@ def interactive_main() -> None:
                     query = input("New calculation to append: ").strip()
                     if not query:
                         continue
+                if not _is_dft_calculation_request(query):
+                    _print_non_calculation_guidance()
+                    continue
                 transport.set_remote_root(_prompt_remote_root(transport.remote_root))
                 result = (
                     agent.run(query, reuse_run_dir=reuse_run_dir)

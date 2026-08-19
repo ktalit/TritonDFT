@@ -14,6 +14,9 @@ STRUCTURE_TERMS = {
 }
 
 
+_LATTICE_RATIO_RE = re.compile(r"\b([abc])\s*/\s*([abc])\b", re.I)
+
+
 @dataclass(frozen=True)
 class StructuralToolCall:
     task: str
@@ -24,7 +27,7 @@ class StructuralToolCall:
 
 def is_structural_question(question: str) -> bool:
     lowered = question.lower()
-    return any(term in lowered for term in STRUCTURE_TERMS)
+    return bool(_LATTICE_RATIO_RE.search(question)) or any(term in lowered for term in STRUCTURE_TERMS)
 
 
 def _parseable(paths: list[Path]) -> list[Path]:
@@ -134,6 +137,9 @@ def plan_structural_tool_call(question: str, structure) -> StructuralToolCall | 
     available = {site.specie.symbol for site in structure}
     species_sequence = _species_symbols(question, available, unique=False)
     species = list(dict.fromkeys(species_sequence))
+    ratio = _LATTICE_RATIO_RE.search(question)
+    if ratio:
+        return StructuralToolCall("lattice_ratio", ratio.group(1).lower(), ratio.group(2).lower())
     if "angle" in lowered and len(species_sequence) >= 3:
         return StructuralToolCall("species_triplet_angles", species_sequence[0], species_sequence[1], species_sequence[2])
     if ("bond" in lowered or "distance" in lowered or "neighbor" in lowered or "neighbour" in lowered) and len(species) >= 2:
@@ -157,6 +163,22 @@ def _lattice(structure) -> dict[str, Any]:
     return {"a_angstrom": a, "b_angstrom": b, "c_angstrom": c,
             "alpha_degree": alpha, "beta_degree": beta, "gamma_degree": gamma,
             "volume_angstrom3": structure.volume, "density_g_cm3": structure.density}
+
+
+def _lattice_ratio(structure, numerator: str, denominator: str) -> dict[str, Any]:
+    lengths = dict(zip(("a", "b", "c"), structure.lattice.abc))
+    if numerator not in lengths or denominator not in lengths:
+        raise ValueError("A lattice ratio must use a, b, or c.")
+    denominator_value = float(lengths[denominator])
+    if denominator_value == 0.0:
+        raise ValueError(f"Cannot calculate {numerator}/{denominator}: denominator is zero.")
+    return {
+        "ratio_name": f"{numerator}/{denominator}",
+        "ratio": float(lengths[numerator]) / denominator_value,
+        "numerator_angstrom": float(lengths[numerator]),
+        "denominator_angstrom": denominator_value,
+        "lattice": _lattice(structure),
+    }
 
 
 def _symmetry(structure) -> dict[str, Any]:
@@ -308,6 +330,8 @@ def call_structural_analysis_tool(run_dir: Path, question: str) -> dict[str, Any
     extra_evidence = []
     if call.task == "lattice":
         result = _lattice(structure)
+    elif call.task == "lattice_ratio":
+        result = _lattice_ratio(structure, call.species1, call.species2)
     elif call.task == "symmetry":
         result = _symmetry(structure)
     elif call.task == "species_pair_bonds":
@@ -355,6 +379,13 @@ def format_structural_tool_result(payload: dict[str, Any]) -> str:
         lines.extend([f"a={result['a_angstrom']:.6f} Å, b={result['b_angstrom']:.6f} Å, c={result['c_angstrom']:.6f} Å",
                       f"α={result['alpha_degree']:.6f}°, β={result['beta_degree']:.6f}°, γ={result['gamma_degree']:.6f}°",
                       f"Volume={result['volume_angstrom3']:.6f} Å³; density={result['density_g_cm3']:.6f} g/cm³"])
+    elif call["task"] == "lattice_ratio":
+        lines.extend([
+            f"Calculated lattice ratio {result['ratio_name']} = {result['ratio']:.10g}",
+            f"Numerator: {result['numerator_angstrom']:.10g} Å",
+            f"Denominator: {result['denominator_angstrom']:.10g} Å",
+            f"Calculation: {result['numerator_angstrom']:.10g} / {result['denominator_angstrom']:.10g}",
+        ])
     elif call["task"] == "symmetry_comparison":
         state = "changed" if result["changed"] else "did not change"
         lines.extend([

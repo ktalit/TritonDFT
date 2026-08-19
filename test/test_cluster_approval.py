@@ -36,6 +36,7 @@ from cluster_agent import (
     _discover_workflows,
     _resolve_workflow_to_open,
     _parse_resume_command,
+    _is_dft_calculation_request,
     _required_parent_artifacts,
     _material_info_from_user_structure,
 )
@@ -127,6 +128,28 @@ class PlaceholderTests(unittest.TestCase):
     def test_resume_prompt_parses_fresh_start_step(self):
         self.assertEqual(_parse_resume_command("resume 1 --fresh-start-step 6"), ("1", 6))
         self.assertEqual(_parse_resume_command("resume latest"), ("latest", None))
+
+    def test_dft_request_intent_checkpoint_accepts_calculation_requests(self):
+        accepted = [
+            "Calculate the relaxed structure and band structure of bulk silicon",
+            "Run an SCF and DOS calculation for MoS2",
+            "Raman spectrum of silicon",
+            "Relax Fe2O3 with DFT+U and report its lattice parameters",
+        ]
+        for query in accepted:
+            with self.subTest(query=query):
+                self.assertTrue(_is_dft_calculation_request(query))
+
+    def test_dft_request_intent_checkpoint_rejects_general_chat(self):
+        rejected = [
+            "What is density functional theory?",
+            "How are you?",
+            "Explain why the sky is blue",
+            "What is a band gap?",
+        ]
+        for query in rejected:
+            with self.subTest(query=query):
+                self.assertFalse(_is_dft_calculation_request(query))
 
     def test_merced_template_preserves_srun_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:

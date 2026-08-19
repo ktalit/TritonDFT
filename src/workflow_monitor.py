@@ -15,11 +15,58 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from results.electronic_reference import electronic_reference, electronic_references
-from results.evidence_qa import evaluate_calculation, evidence_prompt, parse_evidence_answer, search_workflow_evidence, verify_evidence
+from results.evidence_qa import evaluate_calculation, evidence_prompt, merge_evidence, parse_evidence_answer, parse_retrieval_plan, retrieval_plan_prompt, search_workflow_evidence, verify_evidence, workflow_file_manifest, workflow_inventory
 from tool.structural_analysis import call_structural_analysis_tool, format_structural_tool_result
 
 
 VESTA_DOWNLOAD_URL = "https://jp-minerals.org/vesta/en/download.html"
+
+
+def _workflow_capabilities(run_dir: Path) -> set[str]:
+    """Infer requested result panels from persisted workflow metadata.
+
+    Metadata is authoritative for current workflows. Result-file discovery is
+    used only for legacy directories that predate workflow plans/checkpoints.
+    """
+    steps: list[dict] = []
+    state_path = run_dir / "workflow_state.json"
+    plan_path = run_dir / "workflow_plan.json"
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        steps = list(payload.get("plan") or payload.get("steps") or [])
+    except (OSError, ValueError, TypeError):
+        try:
+            payload = json.loads(plan_path.read_text(encoding="utf-8"))
+            steps = list(payload) if isinstance(payload, list) else []
+        except (OSError, ValueError, TypeError):
+            steps = []
+
+    if steps:
+        tools = {str(step.get("tool") or "").strip().lower() for step in steps}
+        capabilities = set()
+        if tools & {"pw_relax", "pw_vc_relax"}:
+            capabilities.add("structure")
+        if tools & {"pw_bands", "bands_post"}:
+            capabilities.add("bands")
+        if tools & {"dos_post"}:
+            capabilities.add("dos")
+        if tools & {"projwfc_post"}:
+            capabilities.add("pdos")
+        if "dynmat_post" in tools:
+            capabilities.add("raman")
+        if tools & {"q2r_post", "matdyn_post"}:
+            capabilities.add("phonons")
+        return capabilities
+
+    # Legacy completed workflows may not have persisted a machine-readable plan.
+    capabilities = set()
+    if _relaxed_structure_path(run_dir) is not None:
+        capabilities.add("structure")
+    if _bands_data(run_dir) is not None:
+        capabilities.add("bands")
+    if _dos_data(run_dir) is not None:
+        capabilities.add("dos")
+    return capabilities
 
 
 def _calculation_input_files(run_dir: Path) -> list[Path]:
@@ -68,6 +115,42 @@ def _bands_data(run_dir: Path):
     if current:
         bands.append(current)
     return (paths[0], bands) if bands else None
+
+
+def _band_symmetry_ticks(run_dir: Path) -> list[tuple[float, str]]:
+    """Return verified bands.x path coordinates paired with saved labels."""
+    labels_path = run_dir / "band_path_labels.json"
+    try:
+        payload = json.loads(labels_path.read_text(encoding="utf-8"))
+        labels = [str(label).strip() for label in payload]
+    except (OSError, ValueError, TypeError):
+        return []
+    if not labels:
+        return []
+
+    # bands.x reports the exact abscissa used by the .gnu file. Prefer the
+    # purpose-named output, while retaining qe.out as a legacy fallback.
+    outputs = sorted(
+        run_dir.rglob("*.out"),
+        key=lambda path: (
+            "bands-post" not in path.name.lower(),
+            "attempts" not in {part.lower() for part in path.parts},
+            str(path),
+        ),
+    )
+    coordinate_re = re.compile(
+        r"high-symmetry\s+point:.*?x\s+coordinate\s+([-+0-9.Ee]+)", re.I
+    )
+    for output in outputs:
+        text = output.read_text(encoding="utf-8", errors="replace")
+        coordinates = [float(value) for value in coordinate_re.findall(text)]
+        if len(coordinates) == len(labels):
+            ticks = []
+            for coordinate, label in zip(coordinates, labels):
+                display = r"$\Gamma$" if label.replace("\\", "").lower() == "gamma" else label
+                ticks.append((coordinate, display))
+            return ticks
+    return []
 
 
 def _dos_data(run_dir: Path):
@@ -183,7 +266,17 @@ class PlotPanel(ttk.Frame):
             for band in data:
                 self.axes.plot([point[0] for point in band], [point[1] - reference for point in band], color="black", lw=0.9)
             self.axes.axhline(0, color="tab:red", ls="--", lw=0.8)
-            self.axes.set_xlabel("k-path distance")
+            symmetry_ticks = _band_symmetry_ticks(self.run_dir)
+            if symmetry_ticks:
+                positions, labels = zip(*symmetry_ticks)
+                self.axes.set_xticks(positions)
+                self.axes.set_xticklabels(labels)
+                for position in positions:
+                    self.axes.axvline(position, color="0.75", lw=0.6, zorder=0)
+                self.axes.set_xlim(positions[0], positions[-1])
+                self.axes.set_xlabel("High-symmetry k-path")
+            else:
+                self.axes.set_xlabel("k-path distance")
             self.axes.set_ylabel(f"Energy - {self.reference.get()} (eV)" if mode != "absolute" else "Absolute energy (eV)")
             self.axes.set_title("Electronic band structure")
         else:
@@ -360,6 +453,7 @@ def _save_vesta_path(run_dir: Path, application: str) -> None:
 
 
 def run_monitor(run_dir: Path) -> None:
+    capabilities = _workflow_capabilities(run_dir)
     root = tk.Tk()
     root.title(f"TritonDFT workflow — {run_dir.name}")
     root.geometry("1100x720")
@@ -387,7 +481,8 @@ def run_monitor(run_dir: Path) -> None:
     structure = tk.Text(structure_frame, wrap="none", font=("Menlo", 11))
     structure.pack(fill="both", expand=True, padx=6, pady=(0, 6))
     structure.configure(state="disabled")
-    notebook.add(structure_frame, text="Structure")
+    if "structure" in capabilities:
+        notebook.add(structure_frame, text="Structure")
 
     def save_cif_as() -> None:
         source = _relaxed_structure_path(run_dir)
@@ -459,10 +554,14 @@ def run_monitor(run_dir: Path) -> None:
     ).pack(side="left", padx=2)
     ttk.Button(structure_controls, text="Save CIF As…", command=save_cif_as).pack(side="left", padx=2)
     ttk.Button(structure_controls, text="Open folder", command=open_structure_folder).pack(side="left", padx=2)
-    bands_panel = PlotPanel(notebook, run_dir, "bands")
-    notebook.add(bands_panel, text="Band structure")
-    dos_panel = PlotPanel(notebook, run_dir, "dos")
-    notebook.add(dos_panel, text="DOS")
+    bands_panel = None
+    if "bands" in capabilities:
+        bands_panel = PlotPanel(notebook, run_dir, "bands")
+        notebook.add(bands_panel, text="Band structure")
+    dos_panel = None
+    if "dos" in capabilities:
+        dos_panel = PlotPanel(notebook, run_dir, "dos")
+        notebook.add(dos_panel, text="DOS")
 
     inputs_frame = ttk.Frame(notebook)
     inputs_note = ttk.Label(inputs_frame, text="Concrete input files used by workflow execution attempts.", wraplength=1040)
@@ -511,6 +610,12 @@ def run_monitor(run_dir: Path) -> None:
     ask_question.pack(side="left", fill="x", expand=True, padx=8)
     ask_button = ttk.Button(ask_top, text="Ask")
     ask_button.pack(side="right")
+    ttk.Label(ask_top, text="Sources").pack(side="left", padx=(8, 2))
+    ask_scope = ttk.Combobox(
+        ask_top, values=("Completed results", "Include failed attempts"), width=20, state="readonly"
+    )
+    ask_scope.set("Completed results")
+    ask_scope.pack(side="right", padx=(2, 8))
     ask_status = ttk.Label(ask_frame, text="Search scope: text results inside this workflow only. Relevant excerpts may be sent to the configured LLM.", wraplength=1040, justify="left")
     ask_status.pack(fill="x", padx=8, pady=(0, 6))
     ask_answer = tk.Text(ask_frame, wrap="word", font=("Menlo", 11))
@@ -531,26 +636,45 @@ def run_monitor(run_dir: Path) -> None:
         ask_status.configure(text=status)
         ask_button.configure(state="normal")
 
-    def ask_worker(question: str) -> None:
+    def ask_worker(question: str, include_failed: bool) -> None:
         try:
             structural = call_structural_analysis_tool(run_dir, question)
             if structural is not None:
                 output = format_structural_tool_result(structural)
                 root.after(0, lambda value=output: finish_ask(value, "Answered by the deterministic pymatgen structural-analysis tool."))
                 return
-            evidence = search_workflow_evidence(run_dir, question)
+            from generator import UnifiedGenerator
+            generator = UnifiedGenerator(model=os.environ.get("CLUSTER_AGENT_MODEL", "gpt-4o"), backend=os.environ.get("CLUSTER_AGENT_BACKEND", "auto"), temperature=0.0)
+            inventory = workflow_inventory(run_dir)
+            manifest = workflow_file_manifest(run_dir, include_failed=include_failed)
+            plan_response = generator(
+                retrieval_plan_prompt(question, inventory, manifest), max_new_tokens=450
+            )
+            plan_raw = plan_response[0].get("generated_text", "") if plan_response else ""
+            retrieval_queries = parse_retrieval_plan(plan_raw)
+            groups = [search_workflow_evidence(
+                run_dir, question, include_failed=include_failed
+            )]
+            for retrieval_query in retrieval_queries:
+                groups.append(search_workflow_evidence(
+                    run_dir, retrieval_query, limit=12, include_failed=include_failed
+                ))
+            evidence = merge_evidence(groups)
             if not evidence:
                 root.after(0, lambda: finish_ask("I could not find relevant evidence in the downloaded workflow files. This question cannot be answered from the available calculation record.", "No supporting lines found."))
                 return
-            from generator import UnifiedGenerator
-            generator = UnifiedGenerator(model=os.environ.get("CLUSTER_AGENT_MODEL", "gpt-4o"), backend=os.environ.get("CLUSTER_AGENT_BACKEND", "auto"), temperature=0.0)
-            response = generator(evidence_prompt(question, evidence), max_new_tokens=900)
+            response = generator(
+                evidence_prompt(question, evidence, inventory), max_new_tokens=1100
+            )
             raw = response[0].get("generated_text", "") if response else ""
             parsed = parse_evidence_answer(raw, {item.evidence_id for item in evidence})
             by_id = {item.evidence_id: item for item in evidence}
             cited = [by_id[item_id] for item_id in parsed["evidence_ids"] if verify_evidence(by_id[item_id])]
             if cited:
-                output = f"Answer\n{parsed['answer']}\n\nConfidence: {parsed['confidence']}\n"
+                output = (
+                    f"Answer ({parsed['answer_type'].capitalize()})\n{parsed['answer']}\n\n"
+                    f"Confidence: {parsed['confidence']}\n"
+                )
                 if parsed["derivation"]:
                     output += f"\nDerivation / interpretation\n{parsed['derivation']}\n"
                 expression = parsed["calculation"]["expression"]
@@ -582,9 +706,11 @@ def run_monitor(run_dir: Path) -> None:
                 return
             evidence_consent["given"] = True
         ask_button.configure(state="disabled")
-        ask_status.configure(text="Searching workflow files and checking evidence…")
+        include_failed = ask_scope.get() == "Include failed attempts"
+        scope_text = "including failed attempts" if include_failed else "completed attempts only"
+        ask_status.configure(text=f"Searching workflow files and checking evidence ({scope_text})…")
         set_ask_text("Working…")
-        threading.Thread(target=ask_worker, args=(question,), daemon=True).start()
+        threading.Thread(target=ask_worker, args=(question, include_failed), daemon=True).start()
 
     ask_button.configure(command=ask_results)
     ask_question.bind("<Return>", ask_results)
@@ -615,8 +741,10 @@ def run_monitor(run_dir: Path) -> None:
         if current_structure != last_structure:
             last_structure = current_structure
             structure.configure(state="normal"); structure.delete("1.0", "end"); structure.insert("1.0", current_structure); structure.configure(state="disabled")
-        bands_panel.refresh_if_available()
-        dos_panel.refresh_if_available()
+        if bands_panel is not None:
+            bands_panel.refresh_if_available()
+        if dos_panel is not None:
+            dos_panel.refresh_if_available()
         refresh_input_files()
         root.after(2000, refresh)
 

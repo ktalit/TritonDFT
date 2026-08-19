@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,8 +20,8 @@ from validation import (
 )
 from cluster_agent import _add_relaxed_structure_placeholder, _workflow_repair_indices
 from results.electronic_reference import electronic_reference, electronic_references
-from results.evidence_qa import evaluate_calculation, parse_evidence_answer, search_workflow_evidence, verify_evidence
-from workflow_monitor import _calculation_input_files, _input_tab_label, _relaxed_structure_to_cif, _resolve_vesta_location
+from results.evidence_qa import evaluate_calculation, merge_evidence, parse_evidence_answer, parse_retrieval_plan, search_workflow_evidence, verify_evidence, workflow_inventory
+from workflow_monitor import _band_symmetry_ticks, _calculation_input_files, _input_tab_label, _relaxed_structure_to_cif, _resolve_vesta_location, _workflow_capabilities
 from tool.structural_analysis import call_structural_analysis_tool
 
 
@@ -53,6 +54,46 @@ Si .25 .25 .25
 
 
 class WorkflowValidationTests(unittest.TestCase):
+    def test_dashboard_band_ticks_pair_saved_labels_with_bands_output_coordinates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "band_path_labels.json").write_text(
+                json.dumps(["\\Gamma", "M", "K", "\\Gamma"]), encoding="utf-8"
+            )
+            (root / "bands-post.out").write_text(
+                "high-symmetry point: 0 0 0 x coordinate 0.0000\n"
+                "high-symmetry point: .5 0 0 x coordinate 0.5774\n"
+                "high-symmetry point: .333 .333 0 x coordinate 0.9107\n"
+                "high-symmetry point: 0 0 0 x coordinate 1.5774\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _band_symmetry_ticks(root),
+                [(0.0, r"$\Gamma$"), (0.5774, "M"), (0.9107, "K"), (1.5774, r"$\Gamma$")],
+            )
+
+    def test_dashboard_band_ticks_require_matching_label_and_coordinate_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "band_path_labels.json").write_text(json.dumps(["G", "X"]), encoding="utf-8")
+            (root / "bands-post.out").write_text(
+                "high-symmetry point: 0 0 0 x coordinate 0.0\n", encoding="utf-8"
+            )
+            self.assertEqual(_band_symmetry_ticks(root), [])
+
+    def test_monitor_tabs_follow_requested_workflow_capabilities(self):
+        cases = [
+            ([{"tool": "pw_vc_relax"}, {"tool": "pw_scf"}], {"structure"}),
+            ([{"tool": "pw_scf"}, {"tool": "pw_nscf"}, {"tool": "dos_post"}], {"dos"}),
+            ([{"tool": "pw_scf"}, {"tool": "pw_bands"}, {"tool": "bands_post"}], {"bands"}),
+            ([{"tool": "pw_bands"}, {"tool": "bands_post"}, {"tool": "dos_post"}], {"bands", "dos"}),
+        ]
+        for plan, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "workflow_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+                self.assertEqual(_workflow_capabilities(root), expected)
+
     def test_unknown_dynmat_keyword_is_removed_before_llm_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "dynmat.in"
@@ -210,6 +251,21 @@ K_POINTS automatic
             self.assertTrue(result["result"]["changed"])
             self.assertEqual(Path(result["result"]["final_structure_file"]), (scf / "scf.in").resolve())
 
+    def test_structural_tool_calculates_requested_lattice_ratio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attempt = root / "attempts" / "01-vc-relax" / "attempt_001"
+            attempt.mkdir(parents=True)
+            (attempt / "relaxed_structure.in").write_text(
+                "CELL_PARAMETERS (angstrom)\n3 0 0\n0 3 0\n0 0 6\n"
+                "ATOMIC_POSITIONS (crystal)\nSi 0 0 0\n",
+                encoding="utf-8",
+            )
+            result = call_structural_analysis_tool(root, "What is c/a of the calculated result?")
+            self.assertEqual(result["call"]["task"], "lattice_ratio")
+            self.assertEqual(result["result"]["ratio_name"], "c/a")
+            self.assertAlmostEqual(result["result"]["ratio"], 2.0)
+
     def test_result_evidence_is_scoped_ranked_and_line_addressable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -240,8 +296,41 @@ K_POINTS automatic
         )
         self.assertEqual(parsed["evidence_ids"], ["E1"])
 
+    def test_result_search_defaults_to_completed_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = root / "attempts" / "01-scf" / "attempt_001"
+            failed = root / "attempts" / "01-scf" / "attempt_002"
+            good.mkdir(parents=True)
+            failed.mkdir(parents=True)
+            (good / "scf.out").write_text("total energy = -10.0\n", encoding="utf-8")
+            (failed / "scf.out").write_text("total energy = -999.0\n", encoding="utf-8")
+            state = {
+                "status": "awaiting_user", "query": "SCF", "steps": [{
+                    "id": 1, "tool": "pw_scf", "branch": "core", "status": "awaiting_user",
+                    "attempt_history": [
+                        {"status": "completed", "local_dir": str(good)},
+                        {"status": "failed", "local_dir": str(failed)},
+                    ],
+                }],
+            }
+            (root / "workflow_state.json").write_text(json.dumps(state), encoding="utf-8")
+            normal = search_workflow_evidence(root, "total energy")
+            self.assertTrue(normal)
+            self.assertFalse(any("attempt_002" in item.relative_path for item in normal))
+            diagnostic = search_workflow_evidence(root, "total energy", include_failed=True)
+            self.assertTrue(any("attempt_002" in item.relative_path for item in diagnostic))
+            self.assertEqual(workflow_inventory(root)["steps"][0]["tool"], "pw_scf")
+
     def test_result_math_is_evaluated_without_arbitrary_python(self):
         self.assertAlmostEqual(evaluate_calculation("0.5 * sqrt(12.3**2)"), 6.15)
+
+    def test_llm_retrieval_plan_is_bounded_and_json_only(self):
+        queries = parse_retrieval_plan(
+            '```json\n{"search_queries":["CELL_PARAMETERS", "lattice parameter", '
+            '"CELL_PARAMETERS"], "reason":"need a and c"}\n```'
+        )
+        self.assertEqual(queries, ["CELL_PARAMETERS", "lattice parameter"])
         self.assertAlmostEqual(evaluate_calculation("degrees(acos(0.5))"), 60.0)
         with self.assertRaises(ValueError):
             evaluate_calculation("__import__('os').system('echo unsafe')")
