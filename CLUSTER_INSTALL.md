@@ -265,6 +265,21 @@ installation log.
 
 ## 8. Configure `.env.cluster`
 
+### Optional central workshop configuration
+
+An administrator can provide shared defaults at
+`/opt/tritondft/config/.env.cluster_admin`. Copy `.env.cluster_admin.example`
+as a starting point. TritonDFT loads the central file first and then loads the
+user's `--env-file`, so `~/.tritondft/.env.cluster` remains an optional personal
+override. Set a different central path with `TRITONDFT_ADMIN_ENV` or
+`--admin-env-file`.
+
+Do not commit the populated administrator file. For a workshop, use a temporary
+restricted API key with provider spending/rate limits and revoke or rotate it
+afterward. A process running as a participant may receive the key in its
+environment, so this convenience setup is not a substitute for a protected API
+proxy when the credential must remain secret from users.
+
 Edit `~/.tritondft/.env.cluster`. The following is an example for a user whose
 TritonDFT client runs locally and submits to LRC:
 

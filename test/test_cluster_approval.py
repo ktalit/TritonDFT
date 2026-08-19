@@ -22,6 +22,7 @@ from cluster_agent import (
     _add_relaxed_structure_placeholder,
     _approval_result,
     _env_missing_cluster_setup,
+    _env_missing_api_keys,
     _extract_relaxed_structure,
     _ensure_env_defaults,
     _input_validation_errors,
@@ -89,6 +90,16 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_admin_environment_can_supply_keys_without_user_env_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / ".env.cluster")
+            with patch.dict(os.environ, {
+                "OPENAI_API_KEY": "workshop-openai",
+                "MP_API_KEY": "workshop-mp",
+            }, clear=False):
+                self.assertFalse(_env_missing_api_keys(missing, include_environment=True))
+                self.assertTrue(_env_missing_api_keys(missing, include_environment=False))
+
     def test_user_supplied_structure_replaces_database_material_info(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "custom.cif"

@@ -136,6 +136,10 @@ add `--remote-qe-bin-dir /path/to/qe/bin`.
 The agent chooses the Slurm walltime and parallel launch settings from the
 generated QE input.
 Any command-line option still overrides the value from `.env.cluster`.
+For centrally managed workshops, TritonDFT can first load administrator defaults
+from `/opt/tritondft/config/.env.cluster_admin` (or `TRITONDFT_ADMIN_ENV`) and
+then apply an optional user `.env.cluster` as an override. See
+`CLUSTER_INSTALL.md`; never commit the populated administrator file.
 Type `exit` or `quit` at the `DFT request>` prompt to stop the loop.
 
 ## [Optional] Deploy Backend in Dokcer

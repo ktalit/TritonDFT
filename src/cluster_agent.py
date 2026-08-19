@@ -131,8 +131,12 @@ def _write_env_file(path: str, values: Dict[str, str]) -> None:
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
-def _env_missing_cluster_setup(path: str) -> bool:
+def _env_missing_cluster_setup(path: str, *, include_environment: bool = False) -> bool:
     data = _read_env_file(path)
+    if include_environment:
+        data = {**data, **{key: os.environ[key] for key in (
+            "CLUSTER_AGENT_SSH_TARGET", "CLUSTER_AGENT_REMOTE_ROOT"
+        ) if os.environ.get(key)}}
     ssh_target = data.get("CLUSTER_AGENT_SSH_TARGET", "").strip()
     remote_root = data.get("CLUSTER_AGENT_REMOTE_ROOT", "").strip()
     if not ssh_target or not remote_root:
@@ -146,8 +150,12 @@ def _env_missing_cluster_setup(path: str) -> bool:
     return False
 
 
-def _env_missing_api_keys(path: str) -> bool:
+def _env_missing_api_keys(path: str, *, include_environment: bool = False) -> bool:
     data = _read_env_file(path)
+    if include_environment:
+        data = {**data, **{key: os.environ[key] for key in (
+            "OPENAI_API_KEY", "MP_API_KEY"
+        ) if os.environ.get(key)}}
     return not data.get("OPENAI_API_KEY") or not data.get("MP_API_KEY")
 
 
@@ -3426,24 +3434,31 @@ def _prompt_vasp_potcar_root(current: str = "") -> str:
 def interactive_main() -> None:
     env_parser = argparse.ArgumentParser(add_help=False)
     env_parser.add_argument(
+        "--admin-env-file",
+        default=os.environ.get("TRITONDFT_ADMIN_ENV", "/opt/tritondft/config/.env.cluster_admin"),
+        help="Optional administrator defaults loaded before the user's env file",
+    )
+    env_parser.add_argument(
         "--env-file",
         default=os.environ.get("CLUSTER_AGENT_ENV_FILE", ".env.cluster"),
         help="Local env file with cluster-agent defaults and API keys",
     )
     env_args, remaining_args = env_parser.parse_known_args()
     _load_env_file(".env")
+    _load_env_file(env_args.admin_env_file, override=True)
     _load_env_file(env_args.env_file, override=True)
 
     if "-h" not in remaining_args and "--help" not in remaining_args:
         print(WELCOME_BANNER, flush=True)
-        if _env_missing_cluster_setup(env_args.env_file):
+        if _env_missing_cluster_setup(env_args.env_file, include_environment=True):
             _run_super_user_setup(env_args.env_file)
             _load_env_file(env_args.env_file, override=True)
 
-        _ensure_env_defaults(env_args.env_file)
-        _load_env_file(env_args.env_file, override=True)
+        if Path(env_args.env_file).expanduser().is_file():
+            _ensure_env_defaults(env_args.env_file)
+            _load_env_file(env_args.env_file, override=True)
 
-        if _env_missing_api_keys(env_args.env_file):
+        if _env_missing_api_keys(env_args.env_file, include_environment=True):
             print(
                 f"\nPlease modify {env_args.env_file} with your OPENAI_API_KEY "
                 "and MP_API_KEY before running TritonDFT."
@@ -3452,6 +3467,7 @@ def interactive_main() -> None:
             _load_env_file(env_args.env_file, override=True)
 
     parser = argparse.ArgumentParser(description="Interactive local-to-Slurm DFT cluster agent")
+    parser.add_argument("--admin-env-file", default=env_args.admin_env_file, help="Optional administrator defaults env file")
     parser.add_argument("--env-file", default=env_args.env_file, help="Local env file with cluster-agent defaults and API keys")
     parser.add_argument(
         "--ssh-target",

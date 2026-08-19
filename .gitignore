@@ -9,6 +9,7 @@ build.log
 install-checkpoints/
 .env
 .env.cluster
+.env.cluster_admin
 tmp
 
 # Secret-bearing local files — NEVER commit these.
