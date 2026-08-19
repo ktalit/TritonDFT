@@ -449,7 +449,7 @@ def _run_super_user_setup(env_file: str) -> None:
             "CLUSTER_AGENT_REMOTE_VASP_COMMAND": os.environ.get("CLUSTER_AGENT_REMOTE_VASP_COMMAND", ""),
             "CLUSTER_AGENT_VASP_POTCAR_ROOT": os.environ.get("CLUSTER_AGENT_VASP_POTCAR_ROOT", ""),
             "CLUSTER_AGENT_VASP_FUNCTIONAL": os.environ.get("CLUSTER_AGENT_VASP_FUNCTIONAL", ""),
-            "CLUSTER_AGENT_NO_QUERY_INFO": os.environ.get("CLUSTER_AGENT_NO_QUERY_INFO", "true"),
+            "CLUSTER_AGENT_NO_QUERY_INFO": os.environ.get("CLUSTER_AGENT_NO_QUERY_INFO", "false"),
         },
     )
     _ensure_env_defaults(env_file)
@@ -1289,6 +1289,7 @@ def _approve_inputs_popup(
     review_stage: str = "inputs",
     workflow_steps: Optional[List[Dict[str, Any]]] = None,
     resource_defaults: Optional[Dict[str, int]] = None,
+    structure_defaults: Optional[Dict[str, Any]] = None,
 ) -> Any:
     plan_only = review_stage == "plan"
     print("\n[approval] Scientific assessment and execution plan are ready." if plan_only else "\n[approval] All inputs are ready.")
@@ -1300,7 +1301,7 @@ def _approve_inputs_popup(
     print("[approval] If the window is behind your IDE, use Cmd-Tab to select Python/TritonDFT.")
     try:
         import tkinter as tk
-        from tkinter import messagebox, ttk
+        from tkinter import filedialog, messagebox, ttk
 
         root = tk.Tk()
         root.title("TritonDFT scientific assessment and plan review" if plan_only else "TritonDFT plan and input approval")
@@ -1334,7 +1335,66 @@ def _approve_inputs_popup(
         notebook.add(graph_text, text="Workflow graph")
 
         resource_entries: Dict[str, Any] = {}
+        structure_controls: Dict[str, Any] = {}
         if plan_only:
+            structure_frame = ttk.Frame(notebook)
+            defaults = structure_defaults or {}
+            source_var = tk.StringVar(
+                value="materials_project" if defaults.get("materials_project_available") else "file"
+            )
+            path_var = tk.StringVar(value=str(defaults.get("path") or ""))
+            ttk.Label(
+                structure_frame,
+                text=(
+                    "Choose the structure used to generate every calculation input. A supplied file "
+                    "replaces Materials Project data and its exact cell and atomic sites are preserved "
+                    "as the workflow starting geometry. Relaxation steps in the reviewed plan are not removed."
+                ),
+                wraplength=980, justify="left",
+            ).pack(fill="x", padx=12, pady=(14, 10))
+            ttk.Label(
+                structure_frame,
+                text=str(defaults.get("materials_project_status") or "Materials Project status unavailable."),
+                wraplength=980, justify="left",
+            ).pack(fill="x", padx=12, pady=(0, 10))
+            mp_button = ttk.Radiobutton(
+                structure_frame,
+                text=("Use the Materials Project structure shown above (default)" if defaults.get("materials_project_available")
+                      else "Use Materials Project structure (none was retrieved)"),
+                variable=source_var, value="materials_project",
+            )
+            mp_button.pack(anchor="w", padx=12, pady=4)
+            if not defaults.get("materials_project_available"):
+                mp_button.configure(state="disabled")
+            ttk.Radiobutton(
+                structure_frame, text="Use my structure file", variable=source_var, value="file"
+            ).pack(anchor="w", padx=12, pady=4)
+            path_row = ttk.Frame(structure_frame)
+            path_row.pack(fill="x", padx=30, pady=8)
+            ttk.Entry(path_row, textvariable=path_var).pack(side="left", fill="x", expand=True)
+
+            def browse_structure() -> None:
+                selected = filedialog.askopenfilename(
+                    title="Choose a crystal structure",
+                    filetypes=[
+                        ("Structure files", "*.cif *.vasp *.poscar *.json *.yaml *.yml *.cssr *.in"),
+                        ("All files", "*"),
+                    ],
+                )
+                if selected:
+                    source_var.set("file")
+                    path_var.set(selected)
+
+            ttk.Button(path_row, text="Browse…", command=browse_structure).pack(side="left", padx=(8, 0))
+            ttk.Label(
+                structure_frame,
+                text=("Supported formats include CIF, POSCAR/CONTCAR, pymatgen JSON/YAML, CSSR, "
+                      "and Quantum ESPRESSO pw.x input files."),
+                wraplength=980,
+            ).pack(anchor="w", padx=30, pady=(0, 12))
+            notebook.add(structure_frame, text="Structure source")
+            structure_controls = {"source": source_var, "path": path_var, "frame": structure_frame}
+
             resources_frame = ttk.Frame(notebook)
             defaults = resource_defaults or {}
             ttk.Label(
@@ -1370,7 +1430,7 @@ def _approve_inputs_popup(
         validation_text.configure(state="disabled")
         notebook.add(validation_text, text="Validation")
 
-        decision = {"action": "cancel", "revision": "", "resources": {}}
+        decision = {"action": "cancel", "revision": "", "resources": {}, "structure": {}}
 
         def read_resources() -> Optional[Dict[str, int]]:
             if not plan_only:
@@ -1439,6 +1499,18 @@ def _approve_inputs_popup(
             resources = read_resources()
             if resources is None:
                 return
+            if plan_only:
+                source = structure_controls["source"].get()
+                structure_path = structure_controls["path"].get().strip()
+                if source == "file":
+                    if not structure_path or not Path(structure_path).expanduser().is_file():
+                        notebook.select(structure_controls["frame"])
+                        messagebox.showerror(
+                            "Structure file required",
+                            "Choose an existing structure file before generating inputs.",
+                        )
+                        return
+                decision["structure"] = {"source": source, "path": structure_path}
             messages = refresh_validation()
             if messages:
                 notebook.select(validation_text)
@@ -1530,7 +1602,26 @@ def _approve_inputs_popup(
                     if min(resources.values()) < 1:
                         print("Nodes and cores per node must both be at least 1.")
                         continue
-                return {"action": "approve", "revision": "", "resources": resources}
+                    mp_available = bool((structure_defaults or {}).get("materials_project_available"))
+                    prompt = (
+                        "Structure source [materials_project/file]"
+                        + (" [materials_project]" if mp_available else " [file]")
+                        + ": "
+                    )
+                    source = input(prompt).strip().lower() or ("materials_project" if mp_available else "file")
+                    structure_path = ""
+                    if source == "file":
+                        structure_path = input("Path to structure file: ").strip()
+                        if not Path(structure_path).expanduser().is_file():
+                            print("The selected structure file does not exist.")
+                            continue
+                    elif source != "materials_project" or not mp_available:
+                        print("No Materials Project structure is available; choose a file.")
+                        continue
+                return {
+                    "action": "approve", "revision": "", "resources": resources,
+                    "structure": {"source": source, "path": structure_path} if plan_only else {},
+                }
             if normalized in {"cancel", "no", "n"}:
                 return {"action": "cancel", "revision": ""}
             if normalized == "revise":
@@ -1546,6 +1637,94 @@ def _approval_result(value: Any) -> tuple[str, str]:
     if isinstance(value, dict):
         return str(value.get("action", "cancel")), str(value.get("revision", "")).strip()
     return ("approve", "") if value else ("cancel", "")
+
+
+def _material_info_from_user_structure(path: str, run_dir: str | Path) -> Dict[str, Any]:
+    """Load an exact user-provided periodic structure and persist its provenance."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"User structure file does not exist: {source}")
+    try:
+        from pymatgen.core import Structure
+
+        try:
+            structure = Structure.from_file(str(source))
+        except Exception as general_error:
+            if source.suffix.lower() not in {".in", ".pwi", ".pw"}:
+                raise general_error
+            # pymatgen's PWInput parser is version-sensitive and fails on some
+            # otherwise valid ibrav=0 inputs. TritonDFT's structure tool already
+            # isolates QE geometry cards and handles those files deterministically.
+            from tool.structural_analysis import _load_structure
+            structure = _load_structure(source)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read user structure {source}. Use a periodic CIF, POSCAR/CONTCAR, "
+            f"pymatgen JSON/YAML, CSSR, or pw.x input file. Parser error: {exc}"
+        ) from exc
+    if len(structure) < 1 or structure.lattice.volume <= 0:
+        raise ValueError(f"User structure is empty or has an invalid cell: {source}")
+
+    destination_dir = Path(run_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    cif_path = destination_dir / "structure_user_supplied.cif"
+    # Writing the returned text avoids the pymatgen/monty implicit-mode
+    # incompatibility present in some supported dependency combinations.
+    cif_path.write_text(structure.to(fmt="cif"), encoding="utf-8")
+    provenance = {
+        "source": "user_file",
+        "original_path": str(source),
+        "stored_cif": str(cif_path),
+        "formula": structure.composition.reduced_formula,
+        "sites": len(structure),
+        "lattice": {
+            "a": structure.lattice.a, "b": structure.lattice.b, "c": structure.lattice.c,
+            "alpha": structure.lattice.alpha, "beta": structure.lattice.beta,
+            "gamma": structure.lattice.gamma,
+        },
+    }
+    (destination_dir / "structure_source.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
+    # The dedicated user_structure field tells prompt assembly not to describe
+    # or reinterpret this exact cell as an MP-derived primitive/conventional cell.
+    return {
+        "user_structure": [structure],
+        "initial_structures": [structure.to(fmt="cif")],
+        "primitive_structure": [],
+        "conventional_structure": [],
+        "material_ids": [],
+        "summary": provenance,
+    }
+
+
+def _materials_project_status(material_info: Dict[str, Any], error: str = "") -> str:
+    """Create a concise, auditable structure-source summary for plan review."""
+    structures = (
+        material_info.get("primitive_structure")
+        or material_info.get("conventional_structure")
+        or material_info.get("relaxed_structures")
+        or []
+    )
+    if not structures:
+        detail = f" Lookup detail: {error}" if error else ""
+        return "Materials Project did not provide a usable structure." + detail
+    structure = structures[0]
+    try:
+        formula = structure.composition.reduced_formula
+        sites = len(structure)
+        lattice = structure.lattice
+        lattice_text = (
+            f"a={lattice.a:.6f} Å, b={lattice.b:.6f} Å, c={lattice.c:.6f} Å; "
+            f"α={lattice.alpha:.4f}°, β={lattice.beta:.4f}°, γ={lattice.gamma:.4f}°"
+        )
+    except Exception:
+        formula, sites, lattice_text = "unknown", "unknown", "lattice details unavailable"
+    material_ids = ", ".join(map(str, material_info.get("material_ids") or [])) or "not reported"
+    return (
+        "Materials Project lookup succeeded. This structure will be used unless you select a file.\n"
+        f"Material ID: {material_ids}    Formula: {formula}    Sites: {sites}\n{lattice_text}"
+    )
 
 
 def _prompt_download_scope(event: str, run_dir: str) -> str:
@@ -2103,8 +2282,22 @@ class RemoteClusterDFTAgent:
                     shutil.copy2(source, self.agent.work_dir / "imported_relaxed_structure.in")
 
         material_info: Dict[str, Any] = {}
+        mp_lookup_error = ""
         if self.agent.need_query_info:
-            material_info = self.agent.info_query(query)
+            try:
+                material_info = self.agent.info_query(query)
+            except Exception as exc:
+                mp_lookup_error = str(exc)
+                print(
+                    "[info_query][warn] Materials Project structure lookup failed; "
+                    "you can supply a structure file in plan review: " + str(exc)
+                )
+                (Path(self.agent.work_dir) / "materials_project_lookup_error.txt").write_text(
+                    str(exc).rstrip() + "\n", encoding="utf-8"
+                )
+                material_info = {}
+        else:
+            mp_lookup_error = "Lookup was explicitly disabled with --no-query-info."
 
         subproblems = []
         plan_feedback = ""
@@ -2204,6 +2397,18 @@ class RemoteClusterDFTAgent:
                     "max_nodes": getattr(self.agent.slurm_launcher, "max_nodes", None),
                     "cores_per_node": getattr(self.agent.slurm_launcher, "cores_per_node", None),
                 },
+                structure_defaults={
+                    "materials_project_available": bool(
+                        parent_state is not None
+                        or material_info.get("user_structure")
+                        or material_info.get("primitive_structure")
+                        or material_info.get("conventional_structure")
+                        or material_info.get("initial_structures")
+                    ),
+                    "materials_project_status": _materials_project_status(
+                        material_info, mp_lookup_error
+                    ),
+                },
             )
             plan_action, plan_revision = _approval_result(plan_decision)
             if plan_action == "revise":
@@ -2237,6 +2442,15 @@ class RemoteClusterDFTAgent:
                 }
             plan_resources = plan_decision.get("resources", {}) if isinstance(plan_decision, dict) else {}
             self._apply_resource_limits(plan_resources, Path(self.agent.work_dir))
+            structure_choice = plan_decision.get("structure", {}) if isinstance(plan_decision, dict) else {}
+            if structure_choice.get("source") == "file":
+                material_info = _material_info_from_user_structure(
+                    str(structure_choice.get("path") or ""), self.agent.work_dir
+                )
+                print(
+                    "[structure] Using user-supplied starting structure: "
+                    + str(Path(structure_choice["path"]).expanduser().resolve())
+                )
 
         packages: List[Dict[str, Any]] = []
         input_paths: List[str] = []
@@ -3281,7 +3495,9 @@ def interactive_main() -> None:
     parser.add_argument(
         "--no-query-info",
         action="store_true",
-        default=os.environ.get("CLUSTER_AGENT_NO_QUERY_INFO", "").lower() in {"1", "true", "yes", "on"},
+        default=False,
+        help=("Explicit offline mode: skip Materials Project lookup. Normal cluster workflows "
+              "always try Materials Project before offering a user structure file."),
     )
     parser.add_argument("--no-master", action="store_true", help="Do not open SSH ControlMaster connection")
     args = parser.parse_args(remaining_args)

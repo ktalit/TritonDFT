@@ -283,7 +283,7 @@ TRITONDFT_SLURM_TEMPLATE=~/.tritondft/example_qe_slurm_job_file.txt
 TRITONDFT_QE_SLURM_TEMPLATE=~/.tritondft/example_qe_slurm_job_file.txt
 TRITONDFT_VASP_SLURM_TEMPLATE=~/.tritondft/example_vasp_slurm_job_file.txt
 CLUSTER_AGENT_REMOTE_QE_BIN_DIR=
-CLUSTER_AGENT_NO_QUERY_INFO=true
+CLUSTER_AGENT_NO_QUERY_INFO=false
 ```
 
 Why each setting exists:
@@ -300,8 +300,10 @@ Why each setting exists:
   administrator maintains a verified shared, read-only template there.
 - `CLUSTER_AGENT_REMOTE_QE_BIN_DIR` stays empty when the Slurm module commands
   put `pw.x` on `PATH`; otherwise set the remote QE `bin` directory.
-- `CLUSTER_AGENT_NO_QUERY_INFO=true` disables Materials Project lookup. An
-  `MP_API_KEY` is needed only when this is changed to `false`.
+- Normal cluster workflows query Materials Project first and require
+  `MP_API_KEY`. Use the explicit `--no-query-info` command-line flag only for
+  intentional offline operation; the planner will then require a user-supplied
+  structure file.
 
 ### Checkpoint 8
 

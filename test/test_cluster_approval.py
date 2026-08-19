@@ -37,6 +37,7 @@ from cluster_agent import (
     _resolve_workflow_to_open,
     _parse_resume_command,
     _required_parent_artifacts,
+    _material_info_from_user_structure,
 )
 from execute_code.slurm import SlurmLauncher
 from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce_safe_qe_parallel_flags
@@ -87,6 +88,42 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_user_supplied_structure_replaces_database_material_info(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "custom.cif"
+            source.write_text(
+                "data_custom\n_symmetry_space_group_name_H-M 'P 1'\n"
+                "_cell_length_a 3.0\n_cell_length_b 3.0\n_cell_length_c 5.0\n"
+                "_cell_angle_alpha 90\n_cell_angle_beta 90\n_cell_angle_gamma 120\n"
+                "loop_\n_atom_site_label\n_atom_site_type_symbol\n_atom_site_fract_x\n"
+                "_atom_site_fract_y\n_atom_site_fract_z\nMo1 Mo 0 0 0\n",
+                encoding="utf-8",
+            )
+            run_dir = Path(tmp) / "run"
+            info = _material_info_from_user_structure(str(source), run_dir)
+            self.assertEqual(len(info["user_structure"]), 1)
+            self.assertEqual(info["primitive_structure"], [])
+            self.assertTrue((run_dir / "structure_user_supplied.cif").is_file())
+            provenance = json.loads((run_dir / "structure_source.json").read_text())
+            self.assertEqual(provenance["source"], "user_file")
+            self.assertEqual(provenance["sites"], 1)
+
+    def test_user_supplied_pw_input_is_parsed_from_geometry_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "scf.in"
+            source.write_text(
+                "&control\n calculation='scf',\n/\n&system\n ibrav=0, nat=2, ntyp=1,\n/\n"
+                "ATOMIC_SPECIES\nSi 28.0855 si.upf\n"
+                "CELL_PARAMETERS (angstrom)\n3 0 0\n0 3 0\n0 0 3\n"
+                "ATOMIC_POSITIONS (crystal)\nSi 0 0 0\nSi 0.25 0.25 0.25\n"
+                "K_POINTS automatic\n4 4 4 0 0 0\n",
+                encoding="utf-8",
+            )
+            info = _material_info_from_user_structure(str(source), Path(tmp) / "run")
+            structure = info["user_structure"][0]
+            self.assertEqual(len(structure), 2)
+            self.assertAlmostEqual(structure.lattice.a, 3.0)
+
     def test_resume_prompt_parses_fresh_start_step(self):
         self.assertEqual(_parse_resume_command("resume 1 --fresh-start-step 6"), ("1", 6))
         self.assertEqual(_parse_resume_command("resume latest"), ("latest", None))

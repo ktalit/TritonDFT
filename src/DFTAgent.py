@@ -696,6 +696,7 @@ User request:
         initial_structures = material_info.get("initial_structures", [])
         conventional_structures = material_info.get("conventional_structure", [])
         primitive_structures = material_info.get("primitive_structure", [])
+        user_structures = material_info.get("user_structure", [])
 
         loop_count = 0
         MAX_LOOPS = 3
@@ -721,6 +722,7 @@ User request:
                     fn_section=fn_spec.section,
                     query=query,
                     initial_structures=initial_structures,
+                    user_structure=user_structures,
                     conventional_structure=conventional_structures,
                     primitive_structure=primitive_structures,
                     subproblem=subproblem['problem'],
@@ -737,6 +739,7 @@ User request:
                     fn_section=fn_spec.section,
                     query=query,
                     initial_structures=initial_structures,
+                    user_structure=user_structures,
                     conventional_structure=conventional_structures,
                     primitive_structure=primitive_structures,
                     subproblem=subproblem['problem'],

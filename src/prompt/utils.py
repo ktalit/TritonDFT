@@ -112,19 +112,33 @@ def get_prompt(prompt_type: str, **kwargs) -> List[Dict[str, str]]:
     #     """ + str(qi) + "\n"
     # else:
     #     kwargs["query_info"] = ""
-    # Now we are using primitive structure info
-    qi = kwargs.get("primitive_structure", "")
-    if qi is not None and str(qi) != "":
+    # An explicit user structure always takes precedence over database-derived
+    # primitive/conventional representations. Preserve its exact cell and sites.
+    user_qi = kwargs.get("user_structure", "")
+    if user_qi is not None and str(user_qi) not in {"", "[]"}:
         kwargs["query_info"] = \
         """
-        ### Initial Structures: Use the following PRIMITIVE unit-cell structure as the starting atomic configuration.
-        - The provided structure is a primitive unit-cell representation.
+        ### USER-SUPPLIED STARTING STRUCTURE (authoritative)
+        - Use this exact periodic cell, species list, site count, and fractional coordinates.
+        - Do not replace it with a Materials Project structure.
+        - Do not standardize, primitive-reduce, conventionalize, or change the setting unless the user explicitly requested that transformation.
+        - A relaxation step may evolve this starting geometry, but the generated relaxation input must begin from exactly this structure.
         - All lattice lengths are in angstrom (Å); lattice angles are in degrees.
-        - Atomic positions are fractional (crystal) coordinates with respect to the lattice vectors.
-        This structure should be used to construct Quantum ESPRESSO inputs.
-        """ + str(qi) + "\n"
+        """ + str(user_qi) + "\n"
+    # Otherwise use primitive Materials Project structure info.
     else:
-        kwargs["query_info"] = ""
+        qi = kwargs.get("primitive_structure", "")
+        if qi is not None and str(qi) != "":
+            kwargs["query_info"] = \
+            """
+            ### Initial Structures: Use the following PRIMITIVE unit-cell structure as the starting atomic configuration.
+            - The provided structure is a primitive unit-cell representation.
+            - All lattice lengths are in angstrom (Å); lattice angles are in degrees.
+            - Atomic positions are fractional (crystal) coordinates with respect to the lattice vectors.
+            This structure should be used to construct Quantum ESPRESSO inputs.
+            """ + str(qi) + "\n"
+        else:
+            kwargs["query_info"] = ""
     # ----------------------------------------
     # --- inject header for previous_run ---
     pr = kwargs.get("previous_run", "")

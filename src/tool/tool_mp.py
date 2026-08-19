@@ -156,7 +156,12 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
                     min_subid = i
                     # print(f"New min ehull: {ehull_min} for {min_id} (subid {min_subid})")
 
+    if min_id is None and material_ids:
+        min_id = material_ids[0]
+        min_subid = 0
     retrieved_structure = relaxed_lookup.get(min_id)
+    if retrieved_structure is None:
+        raise ValueError("Materials Project returned records but no usable periodic structure.")
     # 使用 SpacegroupAnalyzer 进行标准化处理
     sga = SpacegroupAnalyzer(retrieved_structure)
 
@@ -171,8 +176,16 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     result["conventional_structure"].append(conventional)
 
     result["material_ids"].append(min_id)
-    result["initial_structures"].append(init_list[min_id][min_subid])
-    result["relaxed_structures"].append(relaxed_lookup.get(mid)[min_subid])
+    # Some MP records do not expose an initial-structure history. The summary
+    # endpoint structure is still a valid database starting geometry and must
+    # keep the workflow usable rather than raising KeyError here.
+    available_initials = init_list.get(min_id) or []
+    if available_initials:
+        selected_index = min(min_subid or 0, len(available_initials) - 1)
+        result["initial_structures"].append(available_initials[selected_index])
+    else:
+        result["initial_structures"].append(retrieved_structure.to(fmt="cif"))
+    result["relaxed_structures"].append(retrieved_structure)
     # result["conventional_structure"].append(conventional)
     # result["primitive_structure"].append(primitive)
 

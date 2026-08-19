@@ -51,7 +51,8 @@ planner_messages = {
     You are a strict planning assistant for Quantum ESPRESSO ({tool}).
 """ + _OUTPUT_RULES + """
     Structure rule (this is a fact about this pipeline, not a preference):
-    - Every query starts from an INITIAL structure fetched from the Materials Project. This is a STARTING GUESS, NOT the equilibrium geometry — the cell and atomic positions are generally NOT relaxed.
+    - Every query starts from an accepted INITIAL structure. It may come from the Materials Project or from a user-supplied structure file selected during plan review. Do not claim a specific source in the plan; call it the accepted initial structure.
+    - Unless the user explicitly identifies the geometry as trusted/fixed and requests no relaxation, this is a STARTING GUESS, NOT the equilibrium geometry.
     - Therefore the FIRST subproblem MUST ALWAYS be a `pw_vc_relax` that relaxes BOTH the cell and the atomic positions to obtain the equilibrium structure. Do this even when the query does not explicitly mention relaxation, and even if a lattice constant is mentioned.
     - All subsequent subproblems MUST take the RELAXED structure produced by the vc_relax step as their starting structure — never the raw initial structure.
     - Only exception: if the user EXPLICITLY asks to skip relaxation or to use a fixed/given geometry as-is, you may start directly from the provided structure.
@@ -101,6 +102,7 @@ planner_messages_no_force = {
     You are a strict planning assistant for Quantum ESPRESSO ({tool}).
 """ + _OUTPUT_RULES + """
     Structure rule:
+    - The accepted starting structure may come from the Materials Project or a user-supplied file selected during plan review. Do not claim a specific source in the plan.
     - If key structural information (e.g., the equilibrium lattice constant) is already provided or known, you may go straight to the property calculation (e.g. pw_scf).
     - If the equilibrium geometry is unknown or uncertain, relax it first with pw_vc_relax and use the relaxed structure downstream.
 
