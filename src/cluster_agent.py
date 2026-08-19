@@ -1867,7 +1867,7 @@ _DFT_CALCULATION_ACTION_RE = re.compile(
 )
 _DFT_CALCULATION_TARGET_RE = re.compile(
     r"\b(?:dft|density functional|scf|nscf|vc[\s_-]*relax|relax(?:ation|ed structure)?|"
-    r"lattice parameters?|band(?:\s+structure|\s+gap)?|"
+    r"lattice parameters?|band(?:[\s_-]*structure|[\s_-]*gap)?|"
     r"dos|pdos|density of states|phonon|raman|infrared|ir[-\s]+active|elastic|"
     r"dielectric|magnetic moment|total energ|formation energ|fermi|quantum espresso|"
     r"pw\.x|ph\.x|bands\.x|dos\.x|projwfc\.x|vasp)\b",
@@ -1886,7 +1886,10 @@ def _is_dft_calculation_request(query: str) -> bool:
     text = " ".join(str(query).split())
     if not text:
         return False
-    if _DFT_CALCULATION_ACTION_RE.search(text) and _DFT_CALCULATION_TARGET_RE.search(text):
+    # At this dedicated prompt, an explicit computational action is sufficient.
+    # This intentionally favors false positives over blocking valid scientific
+    # requests for properties the checkpoint vocabulary does not yet know.
+    if _DFT_CALCULATION_ACTION_RE.search(text):
         return True
     return bool(_DFT_IMPLICIT_REQUEST_RE.search(text))
 

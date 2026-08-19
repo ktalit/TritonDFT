@@ -44,7 +44,7 @@ from cluster_agent import (
 from execute_code.slurm import SlurmLauncher
 from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce_safe_qe_parallel_flags
 from execute_code.slurm_template import render_slurm_script
-from DFTAgent import DFTAgent, _generate_nonempty_text
+from DFTAgent import DFTAgent, _generate_nonempty_text, _generate_valid_json
 from workflow_state import WorkflowCheckpoint, create_checkpoint
 
 
@@ -143,6 +143,7 @@ class PlaceholderTests(unittest.TestCase):
     def test_dft_request_intent_checkpoint_accepts_calculation_requests(self):
         accepted = [
             "Calculate the relaxed structure and band structure of bulk silicon",
+            "calculate bandstructure for Si Fd3-m structure",
             "Run an SCF and DOS calculation for MoS2",
             "Raman spectrum of silicon",
             "Relax Fe2O3 with DFT+U and report its lattice parameters",
@@ -161,6 +162,20 @@ class PlaceholderTests(unittest.TestCase):
         for query in rejected:
             with self.subTest(query=query):
                 self.assertFalse(_is_dft_calculation_request(query))
+
+    def test_parameter_json_generation_retries_malformed_model_output(self):
+        responses = iter([
+            [{"generated_text": '{"ecutwfc": 80 "ecutrho": 640}'}],
+            [{"generated_text": '{"ecutwfc": 80, "ecutrho": 640}'}],
+        ])
+
+        def generator(*_args, **_kwargs):
+            return next(responses)
+
+        self.assertEqual(
+            _generate_valid_json(generator, "return parameters", max_new_tokens=200, attempts=2),
+            {"ecutwfc": 80, "ecutrho": 640},
+        )
 
     def test_merced_template_preserves_srun_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:

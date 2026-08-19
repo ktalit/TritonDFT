@@ -68,6 +68,36 @@ def _generate_nonempty_text(
     )
 
 
+def _generate_valid_json(
+    generator, prompt: str, *, max_new_tokens: int, attempts: int = 3,
+    verbose: bool = False, purpose: str = "json_generation",
+) -> Dict[str, Any]:
+    """Retry malformed model JSON with explicit format-repair feedback."""
+    current_prompt = prompt
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        raw = _generate_nonempty_text(
+            generator, current_prompt, max_new_tokens=max_new_tokens,
+            attempts=1, verbose=verbose, purpose=purpose,
+        )
+        try:
+            payload = extract_json_brutal(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("The JSON root must be an object.")
+            return payload
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if verbose:
+                print(f"[{purpose}] malformed JSON {attempt}/{attempts}: {exc}")
+            current_prompt = (
+                prompt
+                + "\n\nYour previous response was not valid JSON. Return exactly one valid JSON "
+                  "object with double-quoted keys and strings, no comments, no Markdown fences, "
+                  "and no text before or after the object."
+            )
+    raise ValueError(f"{purpose} returned malformed JSON after {attempts} attempts: {last_error}")
+
+
 
 class JobCancelled(Exception):
     """Raised inside the agent when an approval gate reports the job was
@@ -657,11 +687,11 @@ User request:
         prompt = get_prompt(prompt_type="parameter", subproblem=subproblem['problem'],
                             fn=subproblem['tool'], tool=self.dft_tool, query=query, previous_memory=total_memory)
         try:
-            params_out = self.generator(prompt[0]['content'], max_new_tokens=self.max_new_tokens, return_full_text=False)
-            params_json = params_out[0]['generated_text']
-            # Normalize to actual JSON so scientific decisions can be audited
-            # and later steps receive machine-readable workflow memory.
-            params_json = json.dumps(extract_json_brutal(params_json), ensure_ascii=False)
+            params = _generate_valid_json(
+                self.generator, prompt[0]['content'], max_new_tokens=self.max_new_tokens,
+                attempts=3, verbose=self.verbose, purpose="parameter_generation",
+            )
+            params_json = json.dumps(params, ensure_ascii=False)
             # Don't dump the raw parameter JSON into the streamed log — it is a
             # multi-line LLM blob the user can't act on, and the values that
             # matter end up in the generated input file anyway (downloadable).
