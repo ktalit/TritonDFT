@@ -38,10 +38,35 @@ def _extract_list(snippet: str, key: str) -> Optional[List[Any]]:
     m = re.search(rf"{key}\s*=\s*(\[[^\]]*\])", snippet, re.DOTALL)
     if not m:
         return None
+    try:
+        return ast.literal_eval(m.group(1))
+    except Exception:
+        return None
 
 
 def _normalized_symmetry_symbol(value: str) -> str:
     return re.sub(r"[\s_]", "", str(value or "")).lower()
+
+
+def _resolve_space_group_request(
+    symbol: Optional[str], number: Optional[int]
+) -> tuple[Optional[str], Optional[int]]:
+    """Resolve user-written Hermann-Mauguin aliases to a space-group number.
+
+    Users commonly omit typographical underscores (``P63/mmc`` rather than
+    ``P6_3/mmc``).  Pymatgen understands these aliases, while the MP REST
+    endpoint does not always accept them as ``spacegroup_symbol`` values.
+    Space-group number is therefore the stable API and comparison key.
+    """
+    if number is not None or not symbol:
+        return symbol, number
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        group = SpaceGroup(symbol.strip())
+        return group.symbol, int(group.int_number)
+    except Exception:
+        return symbol, None
 
 
 def _filter_docs_by_requested_symmetry(
@@ -63,18 +88,17 @@ def _filter_docs_by_requested_symmetry(
             actual_point_group = analyzer.get_point_group_symbol()
         except Exception:
             continue
-        if sg_symbol and _normalized_symmetry_symbol(actual_symbol) != _normalized_symmetry_symbol(sg_symbol):
-            continue
+        # A resolved number supersedes textual comparison. This accepts valid
+        # aliases and alternate Hermann-Mauguin settings without weakening the
+        # requested phase constraint.
         if sg_number is not None and int(actual_number) != int(sg_number):
+            continue
+        if sg_number is None and sg_symbol and _normalized_symmetry_symbol(actual_symbol) != _normalized_symmetry_symbol(sg_symbol):
             continue
         if point_group and _normalized_symmetry_symbol(actual_point_group) != _normalized_symmetry_symbol(point_group):
             continue
         matched.append(doc)
     return matched
-    try:
-        return ast.literal_eval(m.group(1))
-    except Exception:
-        return None
 
 
 # ---------- Core function ----------
@@ -111,6 +135,7 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     elements = _extract_list(snippet, "elements")
     sg_symbol = _extract_str(snippet, "spacegroup_symbol")
     sg_number = _extract_int(snippet, "spacegroup_number")
+    sg_symbol, sg_number = _resolve_space_group_request(sg_symbol, sg_number)
     point_group = _extract_str(snippet, "point_group_symbol") or _extract_str(snippet, "point_group")
     chemsys = _extract_str(snippet, "chemsys")
 
@@ -118,15 +143,32 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     # request so selection does not issue one API request per candidate.
     if not material_ids:
         with MPRester(use_document_model=False) as mpr:
-            docs_iter = mpr.materials.summary.search(
-                formula=formula,
-                elements=elements,
-                spacegroup_symbol=sg_symbol,
-                spacegroup_number=sg_number,
-                chemsys=chemsys,
-                fields=["material_id", "structure", "energy_above_hull"],
-            )
-            docs = list(docs_iter)
+            query = {
+                "formula": formula,
+                "elements": elements,
+                "chemsys": chemsys,
+                "fields": ["material_id", "structure", "energy_above_hull"],
+            }
+            # Prefer the unambiguous number. Pass a symbol only when it could
+            # not be resolved, so user notation is never forced to match MP's
+            # exact spelling.
+            if sg_number is not None:
+                query["spacegroup_number"] = sg_number
+            elif sg_symbol:
+                query["spacegroup_symbol"] = sg_symbol
+            try:
+                docs_iter = mpr.materials.summary.search(**query)
+                docs = list(docs_iter)
+            except Exception:
+                # A symmetry-filtered MP endpoint can reject an otherwise
+                # valid alias or temporarily fail. Retrieve formula candidates
+                # and enforce the resolved symmetry locally instead.
+                fallback_query = {
+                    key: value for key, value in query.items()
+                    if key not in {"spacegroup_symbol", "spacegroup_number"}
+                }
+                docs_iter = mpr.materials.summary.search(**fallback_query)
+                docs = list(docs_iter)
     else:
         with MPRester(use_document_model=False) as mpr:
             docs_iter = mpr.materials.summary.search(

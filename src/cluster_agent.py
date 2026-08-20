@@ -1775,18 +1775,43 @@ def _prompt_failure_action(step_label: str, error: str) -> str:
     }.get(answer, "stop")
 
 
-def _launch_workflow_monitor(run_dir: str | Path) -> None:
-    """Open a non-blocking status/validation window that remains alive during execution."""
+def _launch_workflow_monitor(run_dir: str | Path) -> bool:
+    """Open the monitor and surface immediate Tk/X11 startup failures."""
     monitor = Path(__file__).with_name("workflow_monitor.py")
-    try:
-        subprocess.Popen(
-            [sys.executable, str(monitor), str(Path(run_dir).resolve())],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+    resolved_run_dir = Path(run_dir).resolve()
+    if sys.platform != "darwin" and os.name != "nt" and not os.environ.get("DISPLAY"):
+        print(
+            "[monitor] Cannot open the graphical dashboard because DISPLAY is not set.\n"
+            "Reconnect with X forwarding, for example: ssh -Y user@cluster, then restart TritonDFT."
         )
+        return False
+    log_path = resolved_run_dir / "workflow_monitor.log"
+    try:
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            process = subprocess.Popen(
+                [sys.executable, str(monitor), str(resolved_run_dir)],
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     except OSError as exc:
         print(f"[monitor] live workflow window unavailable: {exc}")
+        return False
+    time.sleep(0.4)
+    return_code = process.poll()
+    if return_code is not None:
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            detail = "\n".join(lines[-12:])
+        except OSError:
+            detail = ""
+        print(f"[monitor] Dashboard exited during startup (code {return_code}).")
+        if detail:
+            print(f"[monitor] Last log lines:\n{detail}")
+        print(f"[monitor] Full log: {log_path}")
+        return False
+    print(f"[monitor] Dashboard process {process.pid} started. Log: {log_path}")
+    return True
 
 
 def _discover_workflows(work_root: str | Path) -> List[Dict[str, Any]]:
@@ -2101,10 +2126,8 @@ class RemoteClusterDFTAgent:
                 continue
             try:
                 if command == "edit":
-                    print("Edit these file(s):")
-                    for path in failed.input_paths:
-                        print(f"  - {path}")
-                    input("Press Enter after saving your edits to validate and resume...")
+                    if not self._review_recovery_inputs(state, failed):
+                        continue
                 elif command == "fresh":
                     self.fresh_start_step(run_dir, failed.id)
                 elif command == "retry":
@@ -2125,6 +2148,36 @@ class RemoteClusterDFTAgent:
             except Exception as exc:
                 current_error = str(exc)
                 print(f"[recovery] Attempt paused again: {exc}")
+
+    def _review_recovery_inputs(self, state: WorkflowCheckpoint, failed) -> bool:
+        """Open the tabbed editor for a failed step and validate before retry."""
+        input_paths = [path for path in failed.input_paths if Path(path).is_file()]
+        if not input_paths:
+            print("[recovery] No editable input files were found for this step.")
+            return False
+
+        def workflow_validation() -> List[str]:
+            issues = validate_generated_workflow(state.query, state.plan, state.packages)
+            return [issue.format() for issue in issues if issue.blocking]
+
+        review = (
+            f"Recovery input review for step {failed.id} ({failed.tool})\n\n"
+            f"Last error:\n{failed.last_error or 'No diagnostic was recorded.'}\n\n"
+            "Edit the input tab(s), select Validate, then choose Approve & Run. "
+            "The existing workflow checkpoint and completed parent calculations are preserved."
+        )
+        decision = _approve_inputs_popup(
+            review,
+            input_paths,
+            workflow_validation,
+            workflow_steps=state.plan,
+        )
+        action, _revision = _approval_result(decision)
+        if action != "approve":
+            print("[recovery] Input edit was not approved; workflow remains paused.")
+            return False
+        print(f"[recovery] Edited input for step {failed.id} approved; validating and resuming.")
+        return True
 
     def recover_interactively(self, run_dir: str, error: str) -> Optional[Dict[str, Any]]:
         """Offer checkpoint-preserving repair/edit/retry choices after a runtime failure."""
@@ -2166,12 +2219,7 @@ class RemoteClusterDFTAgent:
             self.fresh_start_step(state.run_dir, failed.id)
             return self.resume(state.run_dir)
         if action == "edit":
-            print("Edit these file(s):")
-            for path in failed.input_paths:
-                print(f"  - {path}")
-            try:
-                input("Press Enter after saving your edits to validate and resume...")
-            except (EOFError, OSError):
+            if not self._review_recovery_inputs(state, failed):
                 return None
             return self.resume(state.run_dir)
         if action == "retry":

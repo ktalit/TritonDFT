@@ -139,7 +139,20 @@ class UnifiedGenerator:
             if api_key is None:
                 raise ValueError("OPENAI_API_KEY is required.")
 
-            self._oa_client = OpenAI(api_key=api_key, base_url=base_url)
+            # Bound individual API calls so malformed-output retries cannot
+            # leave the terminal apparently frozen indefinitely. The outer
+            # generation helpers retain responsibility for semantic retries.
+            try:
+                request_timeout = float(os.getenv("TRITONDFT_LLM_TIMEOUT_SECONDS", "180"))
+            except ValueError:
+                request_timeout = 180.0
+            request_timeout = max(10.0, request_timeout)
+            self._oa_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=request_timeout,
+                max_retries=1,
+            )
             if self.verbose:
                 print(f"[UnifiedGenerator] OpenAI backend @ {model}")
 

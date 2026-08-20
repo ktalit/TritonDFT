@@ -21,7 +21,7 @@ from validation import (
 from cluster_agent import _add_relaxed_structure_placeholder, _workflow_repair_indices
 from results.electronic_reference import electronic_reference, electronic_references
 from results.evidence_qa import evaluate_calculation, merge_evidence, parse_evidence_answer, parse_retrieval_plan, search_workflow_evidence, verify_evidence, workflow_inventory
-from workflow_monitor import _band_symmetry_ticks, _calculation_input_files, _input_tab_label, _relaxed_structure_to_cif, _resolve_vesta_location, _workflow_capabilities
+from workflow_monitor import _band_symmetry_ticks, _calculation_input_files, _input_tab_label, _pdos_data, _relaxed_structure_to_cif, _resolve_vesta_location, _workflow_capabilities
 from tool.structural_analysis import call_structural_analysis_tool
 
 
@@ -87,12 +87,29 @@ class WorkflowValidationTests(unittest.TestCase):
             ([{"tool": "pw_scf"}, {"tool": "pw_nscf"}, {"tool": "dos_post"}], {"dos"}),
             ([{"tool": "pw_scf"}, {"tool": "pw_bands"}, {"tool": "bands_post"}], {"bands"}),
             ([{"tool": "pw_bands"}, {"tool": "bands_post"}, {"tool": "dos_post"}], {"bands", "dos"}),
+            ([{"tool": "pw_nscf"}, {"tool": "dos_post"}, {"tool": "projwfc_post"}], {"dos", "pdos"}),
         ]
         for plan, expected in cases:
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / "workflow_plan.json").write_text(json.dumps(plan), encoding="utf-8")
                 self.assertEqual(_workflow_capabilities(root), expected)
+
+    def test_dashboard_pdos_groups_species_and_orbitals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wf.pdos_atm#1(Mo)_wfc#3(d)").write_text(
+                "# E (eV) ldos(E) pdos(E)\n-1.0 1.5 1.0\n0.0 2.0 1.2\n",
+                encoding="utf-8",
+            )
+            (root / "wf.pdos_atm#2(Mo)_wfc#3(d)").write_text(
+                "# E (eV) ldos(E) pdos(E)\n-1.0 0.5 0.4\n0.0 1.0 0.7\n",
+                encoding="utf-8",
+            )
+            paths, series = _pdos_data(root)
+            self.assertEqual(len(paths), 2)
+            self.assertEqual(series[0][0], "Mo-d")
+            self.assertEqual(series[0][2], [2.0, 3.0])
 
     def test_unknown_dynmat_keyword_is_removed_before_llm_retry(self):
         with tempfile.TemporaryDirectory() as tmp:

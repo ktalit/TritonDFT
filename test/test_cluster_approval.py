@@ -46,7 +46,11 @@ from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce
 from execute_code.slurm_template import render_slurm_script
 from DFTAgent import DFTAgent, _generate_nonempty_text, _generate_valid_json
 from workflow_state import WorkflowCheckpoint, create_checkpoint
-from tool.tool_mp import fetch_material_info_from_api_snippet, _filter_docs_by_requested_symmetry
+from tool.tool_mp import (
+    fetch_material_info_from_api_snippet,
+    _filter_docs_by_requested_symmetry,
+    _resolve_space_group_request,
+)
 
 
 PW_INPUT = """&control
@@ -91,6 +95,58 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_material_lookup_resolves_space_group_alias_to_number(self):
+        symbol, number = _resolve_space_group_request("P63/mmc", None)
+        self.assertEqual(number, 194)
+
+    def test_material_lookup_retries_without_server_side_symmetry_filter(self):
+        from pymatgen.core import Lattice, Structure
+
+        structure = Structure(
+            Lattice.hexagonal(3.16, 12.3),
+            ["Mo", "Mo", "S", "S", "S", "S"],
+            [
+                [1 / 3, 2 / 3, 1 / 4], [2 / 3, 1 / 3, 3 / 4],
+                [1 / 3, 2 / 3, 0.621], [2 / 3, 1 / 3, 0.121],
+                [2 / 3, 1 / 3, 0.379], [1 / 3, 2 / 3, 0.879],
+            ],
+        )
+        calls = []
+
+        class SummaryEndpoint:
+            def search(self, **kwargs):
+                calls.append(kwargs)
+                if "spacegroup_number" in kwargs:
+                    raise RuntimeError("simulated MP filtered-query failure")
+                return [{
+                    "material_id": "mp-mos2",
+                    "structure": structure,
+                    "energy_above_hull": 0.0,
+                }]
+
+        class MaterialsEndpoint:
+            def __init__(self):
+                self.summary = SummaryEndpoint()
+
+            def search(self, **_kwargs):
+                return [{"material_id": "mp-mos2", "initial_structures": [structure]}]
+
+        class FakeMPRester:
+            def __init__(self, **_kwargs):
+                self.materials = MaterialsEndpoint()
+
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        with patch("mp_api.client.MPRester", FakeMPRester):
+            result = fetch_material_info_from_api_snippet(
+                'mpr.materials.search(formula="MoS2", spacegroup_symbol="P63/mmc")'
+            )
+
+        self.assertEqual(result["material_ids"], ["mp-mos2"])
+        self.assertEqual(calls[0]["spacegroup_number"], 194)
+        self.assertNotIn("spacegroup_number", calls[1])
+
     def test_material_lookup_ranks_once_then_fetches_only_selected_history(self):
         from pymatgen.core import Lattice, Structure
 
@@ -238,6 +294,38 @@ class PlaceholderTests(unittest.TestCase):
             _generate_valid_json(generator, "return parameters", max_new_tokens=200, attempts=2),
             {"ecutwfc": 80, "ecutrho": 640},
         )
+
+    def test_parameter_json_repair_receives_broken_response_and_parser_error(self):
+        prompts = []
+
+        def generator(prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return [{"generated_text": '{"ecutwfc": 80 "ecutrho": 640}'}]
+            return [{"generated_text": '{"ecutwfc": 80, "ecutrho": 640}'}]
+
+        result = _generate_valid_json(
+            generator, "return parameters", max_new_tokens=200, attempts=2
+        )
+        self.assertEqual(result["ecutrho"], 640)
+        self.assertIn('{"ecutwfc": 80 "ecutrho": 640}', prompts[1])
+        self.assertIn("Parser error", prompts[1])
+        self.assertIn("Preserve every scientific choice", prompts[1])
+
+    def test_parameter_json_generation_retries_transient_api_failure(self):
+        calls = {"count": 0}
+
+        def generator(*_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise TimeoutError("temporary timeout")
+            return [{"generated_text": '{"ecutwfc": 80, "ecutrho": 640}'}]
+
+        result = _generate_valid_json(
+            generator, "return parameters", max_new_tokens=200, attempts=2
+        )
+        self.assertEqual(result["ecutwfc"], 80)
+        self.assertEqual(calls["count"], 2)
 
     def test_merced_template_preserves_srun_launcher(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -783,6 +871,41 @@ class ApprovalWorkflowTests(unittest.TestCase):
                 result = remote.recovery_console(str(root), "first failure")
             self.assertEqual(result["status"], "new_request")
             self.assertEqual(resume.call_count, 1)
+
+    def test_recovery_edit_opens_tabbed_input_review_before_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "bands-post.in"
+            input_path.write_text("&BANDS\n prefix='wf',\n outdir='./',\n/\n", encoding="utf-8")
+            plan = [{
+                "id": 4, "problem": "Postprocess bands", "tool": "bands_post",
+                "input": "bands data", "why": "plotting",
+            }]
+            packages = [{
+                "input_paths": [str(input_path)],
+                "output_paths": [str(root / "bands-post.out")],
+                "work_dir": str(root),
+                "exec_name": "bands.x",
+            }]
+            checkpoint = create_checkpoint("bands", root, plan, packages)
+            checkpoint.step(4).set_status("awaiting_user", "bands.x input error")
+            checkpoint.status = "awaiting_user"
+            checkpoint.save()
+            remote = _TestRemoteAgent(
+                _FakeAgent(root),
+                _FakeTransport({"approved": True, "uploaded": []}),
+                approval_callback=lambda *_args: True,
+            )
+            with patch("builtins.input", side_effect=["edit"]), patch(
+                "cluster_agent._approve_inputs_popup",
+                return_value={"action": "approve", "revision": ""},
+            ) as popup, patch.object(
+                remote, "resume", return_value={"status": "success", "run_dir": str(root)}
+            ) as resume:
+                result = remote.recovery_console(str(root), "bands.x input error")
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(popup.call_args.args[1], [str(input_path)])
+            resume.assert_called_once_with(str(root))
 
     def test_explicit_lda_selects_lda_pseudopotential_library(self):
         agent = object.__new__(DFTAgent)

@@ -11,6 +11,7 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
+from collections import defaultdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -168,6 +169,50 @@ def _dos_data(run_dir: Path):
     return (paths[0], rows) if rows else None
 
 
+def _pdos_data(run_dir: Path):
+    """Aggregate QE projwfc.x files into species/orbital plot series."""
+    grouped = defaultdict(list)
+    paths = []
+    pattern = re.compile(r"atm#\d+\(([^)]+)\).*wfc#\d+\(([spdf])", re.I)
+    for path in sorted(run_dir.rglob("*pdos_atm*")):
+        if not path.is_file():
+            continue
+        match = pattern.search(path.name)
+        if not match:
+            continue
+        rows = []
+        header = ""
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if raw.lstrip().startswith("#"):
+                header += " " + raw.lower()
+                continue
+            try:
+                values = [float(value) for value in raw.split()]
+            except ValueError:
+                continue
+            if len(values) >= 2:
+                rows.append(values)
+        if rows:
+            species = re.sub(r"_(?:up|down)$", "", match.group(1), flags=re.I)
+            grouped[(species, match.group(2).lower())].append(
+                (rows, "ldosup" in header or "pdosup" in header)
+            )
+            paths.append(path)
+    series = []
+    for (species, orbital), datasets in sorted(grouped.items()):
+        length = min(len(rows) for rows, _spin in datasets)
+        if not length:
+            continue
+        energy = [datasets[0][0][index][0] for index in range(length)]
+        spin_polarized = any(spin for _rows, spin in datasets)
+        up = [sum(rows[index][1] for rows, _spin in datasets) for index in range(length)]
+        down = None
+        if spin_polarized and all(min(len(row) for row in rows[:length]) >= 3 for rows, _spin in datasets):
+            down = [sum(rows[index][2] for rows, _spin in datasets) for index in range(length)]
+        series.append((f"{species}-{orbital}", energy, up, down))
+    return (paths, series) if series else None
+
+
 def _float_or_none(value: str):
     value = value.strip()
     return None if not value else float(value)
@@ -252,12 +297,21 @@ class PlotPanel(ttk.Frame):
         except ValueError:
             messagebox.showerror("Invalid plot limit", "Plot limits must be numbers or blank for automatic scaling.")
             return
-        source = _bands_data(self.run_dir) if self.kind == "bands" else _dos_data(self.run_dir)
+        source = (
+            _bands_data(self.run_dir) if self.kind == "bands" else
+            _pdos_data(self.run_dir) if self.kind == "pdos" else
+            _dos_data(self.run_dir)
+        )
         if not source:
-            self.note.configure(text="No downloaded band data found." if self.kind == "bands" else "No downloaded DOS data found.")
+            missing = {
+                "bands": "No downloaded band data found.",
+                "pdos": "No downloaded projected-DOS data found.",
+                "dos": "No downloaded DOS data found.",
+            }
+            self.note.configure(text=missing[self.kind])
             return
         path, data = source
-        self.loaded_path = str(path)
+        self.loaded_path = "|".join(str(item) for item in path) if self.kind == "pdos" else str(path)
         mode = self.reference.get().lower()
         refs = electronic_references(self.run_dir)
         reference = electronic_reference(self.run_dir, mode)
@@ -279,7 +333,7 @@ class PlotPanel(ttk.Frame):
                 self.axes.set_xlabel("k-path distance")
             self.axes.set_ylabel(f"Energy - {self.reference.get()} (eV)" if mode != "absolute" else "Absolute energy (eV)")
             self.axes.set_title("Electronic band structure")
-        else:
+        elif self.kind == "dos":
             energies = [row[0] - reference for row in data]
             ncol = min(len(row) for row in data)
             if ncol >= 4:
@@ -292,6 +346,17 @@ class PlotPanel(ttk.Frame):
             self.axes.set_xlabel(f"Energy - {self.reference.get()} (eV)" if mode != "absolute" else "Absolute energy (eV)")
             self.axes.set_ylabel("DOS (states/eV)")
             self.axes.set_title("Total density of states")
+        else:
+            for label, raw_energy, up, down in data:
+                energies = [energy - reference for energy in raw_energy]
+                self.axes.plot(energies, up, label=label)
+                if down is not None:
+                    self.axes.plot(energies, [-value for value in down], ls="--", label=f"{label} down")
+            self.axes.axvline(0, color="tab:red", ls="--", lw=0.8)
+            self.axes.set_xlabel(f"Energy - {self.reference.get()} (eV)" if mode != "absolute" else "Absolute energy (eV)")
+            self.axes.set_ylabel("Projected DOS (states/eV)")
+            self.axes.set_title("Orbital-projected density of states")
+            self.axes.legend(fontsize=8, ncol=2)
         if limits["xmin"] is not None or limits["xmax"] is not None:
             self.axes.set_xlim(left=limits["xmin"], right=limits["xmax"])
         if limits["ymin"] is not None or limits["ymax"] is not None:
@@ -299,22 +364,32 @@ class PlotPanel(ttk.Frame):
         self.figure.tight_layout()
         self.canvas.draw_idle()
         available = "available references: " + ", ".join(f"{key}={value:.6g} eV" for key, value in sorted(refs.items()))
-        self.note.configure(text=f"Source: {path.name}; {available}")
+        source_text = f"{len(path)} projwfc files" if self.kind == "pdos" else path.name
+        self.note.configure(text=f"Source: {source_text}; {available}")
         _write_plot_settings(self.run_dir, self.kind, {
             **limits, "reference": self.reference.get(), "reference_energy_ev": reference,
-            "source": str(path),
+            "source": [str(item) for item in path] if self.kind == "pdos" else str(path),
         })
 
     def refresh_if_available(self):
-        source = _bands_data(self.run_dir) if self.kind == "bands" else _dos_data(self.run_dir)
-        if source and str(source[0]) != self.loaded_path:
+        source = (
+            _bands_data(self.run_dir) if self.kind == "bands" else
+            _pdos_data(self.run_dir) if self.kind == "pdos" else
+            _dos_data(self.run_dir)
+        )
+        signature = "|".join(str(item) for item in source[0]) if source and self.kind == "pdos" else str(source[0]) if source else ""
+        if source and signature != self.loaded_path:
             self.draw()
 
     def save(self, extension: str):
         if self.figure is None or not self.loaded_path:
             messagebox.showinfo("No plot", "Download the numerical results and generate the plot first.")
             return
-        default = "band_structure_custom" if self.kind == "bands" else "total_dos_custom"
+        default = {
+            "bands": "band_structure_custom",
+            "dos": "total_dos_custom",
+            "pdos": "projected_dos_custom",
+        }[self.kind]
         path = filedialog.asksaveasfilename(
             initialdir=str(self.run_dir), initialfile=f"{default}.{extension}",
             defaultextension=f".{extension}", filetypes=[(extension.upper(), f"*.{extension}")],
@@ -567,6 +642,10 @@ def run_monitor(run_dir: Path) -> None:
     if "dos" in capabilities:
         dos_panel = PlotPanel(notebook, run_dir, "dos")
         notebook.add(dos_panel, text="DOS")
+    pdos_panel = None
+    if "pdos" in capabilities:
+        pdos_panel = PlotPanel(notebook, run_dir, "pdos")
+        notebook.add(pdos_panel, text="PDOS")
 
     inputs_frame = ttk.Frame(notebook)
     inputs_note = ttk.Label(inputs_frame, text="Concrete input files used by workflow execution attempts.", wraplength=1040)
@@ -750,6 +829,8 @@ def run_monitor(run_dir: Path) -> None:
             bands_panel.refresh_if_available()
         if dos_panel is not None:
             dos_panel.refresh_if_available()
+        if pdos_panel is not None:
+            pdos_panel.refresh_if_available()
         refresh_input_files()
         root.after(2000, refresh)
 

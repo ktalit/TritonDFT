@@ -75,11 +75,31 @@ def _generate_valid_json(
     """Retry malformed model JSON with explicit format-repair feedback."""
     current_prompt = prompt
     last_error: Optional[Exception] = None
+    previous_raw = ""
     for attempt in range(1, attempts + 1):
-        raw = _generate_nonempty_text(
-            generator, current_prompt, max_new_tokens=max_new_tokens,
-            attempts=1, verbose=verbose, purpose=purpose,
-        )
+        if verbose and attempt > 1:
+            print(
+                f"[{purpose}] requesting corrected JSON "
+                f"(attempt {attempt}/{attempts})...",
+                flush=True,
+            )
+        try:
+            raw = _generate_nonempty_text(
+                generator, current_prompt, max_new_tokens=max_new_tokens,
+                attempts=1, verbose=verbose, purpose=purpose,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            if verbose:
+                print(
+                    f"[{purpose}] API call failed on attempt {attempt}/{attempts}; "
+                    "retrying with the same request.",
+                    flush=True,
+                )
+            time.sleep(attempt)
+            continue
         try:
             payload = extract_json_brutal(raw)
             if not isinstance(payload, dict):
@@ -87,15 +107,23 @@ def _generate_valid_json(
             return payload
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = exc
+            previous_raw = raw
             if verbose:
                 print(f"[{purpose}] malformed JSON {attempt}/{attempts}: {exc}")
+            # Supply the exact broken response and parser diagnostic. This is
+            # substantially more reliable than asking the model to regenerate
+            # the scientific parameters without seeing what needs repair.
+            malformed = previous_raw[-16000:]
             current_prompt = (
                 prompt
-                + "\n\nYour previous response was not valid JSON. Return exactly one valid JSON "
-                  "object with double-quoted keys and strings, no comments, no Markdown fences, "
-                  "and no text before or after the object."
+                + "\n\nJSON SYNTAX REPAIR REQUIRED. Preserve every scientific choice and value "
+                  "from the previous response; repair syntax only. Do not add, remove, reinterpret, "
+                  "or recalculate parameters. Return exactly one valid JSON object with double-quoted "
+                  "keys and strings, no comments, no trailing commas, no Markdown fences, and no text "
+                  "before or after the object.\n\n"
+                  f"Parser error:\n{exc}\n\nMalformed response to repair:\n{malformed}"
             )
-    raise ValueError(f"{purpose} returned malformed JSON after {attempts} attempts: {last_error}")
+    raise ValueError(f"{purpose} did not return valid JSON after {attempts} attempts: {last_error}")
 
 
 
