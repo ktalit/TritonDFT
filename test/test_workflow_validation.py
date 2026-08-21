@@ -21,7 +21,8 @@ from validation import (
 from cluster_agent import _add_relaxed_structure_placeholder, _workflow_repair_indices
 from results.electronic_reference import electronic_reference, electronic_references
 from results.evidence_qa import evaluate_calculation, merge_evidence, parse_evidence_answer, parse_retrieval_plan, search_workflow_evidence, verify_evidence, workflow_inventory
-from workflow_monitor import _band_symmetry_ticks, _calculation_input_files, _input_tab_label, _pdos_data, _relaxed_structure_to_cif, _resolve_vesta_location, _workflow_capabilities
+from workflow_monitor import _band_symmetry_ticks, _calculation_input_files, _input_tab_label, _pdos_data, _phonon_dispersion_data, _phonon_path_ticks, _raman_mode_data, _relaxed_structure_to_cif, _resolve_vesta_location, _workflow_capabilities
+from results.raman_plot import broaden_raman_modes
 from tool.structural_analysis import call_structural_analysis_tool
 
 
@@ -88,12 +89,70 @@ class WorkflowValidationTests(unittest.TestCase):
             ([{"tool": "pw_scf"}, {"tool": "pw_bands"}, {"tool": "bands_post"}], {"bands"}),
             ([{"tool": "pw_bands"}, {"tool": "bands_post"}, {"tool": "dos_post"}], {"bands", "dos"}),
             ([{"tool": "pw_nscf"}, {"tool": "dos_post"}, {"tool": "projwfc_post"}], {"dos", "pdos"}),
+            ([{"tool": "pw_phonon_gamma"}, {"tool": "q2r_post"}, {"tool": "matdyn_post"}], {"phonons"}),
+            ([{"tool": "pw_phonon_gamma"}, {"tool": "dynmat_post"}], {"raman"}),
         ]
         for plan, expected in cases:
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / "workflow_plan.json").write_text(json.dumps(plan), encoding="utf-8")
                 self.assertEqual(_workflow_capabilities(root), expected)
+
+    def test_dashboard_parses_matdyn_frequency_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "workflow.phonon_dispersion.freq"
+            path.write_text(
+                "&plot nbnd= 3, nks= 2 /\n"
+                "0.0 0.0 0.0\n-1.0 0.0 500.0\n"
+                "0.5 0.0 0.0\n10.0 20.0 510.0\n",
+                encoding="utf-8",
+            )
+            source, distance, branches, qpoints = _phonon_dispersion_data(root)
+            self.assertEqual(source, path)
+            self.assertEqual(distance, [0.0, 0.5])
+            self.assertEqual(branches, [[-1.0, 10.0], [0.0, 20.0], [500.0, 510.0]])
+            self.assertEqual(qpoints, [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]])
+
+    def test_dashboard_parses_gamma_raman_frequencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "raman-analysis.out"
+            path.write_text(
+                "freq ( 1) =  1.0 [THz] = 33.3 [cm-1]\n"
+                "freq ( 2) =  2.0 [THz] = 66.6 [cm-1]\n",
+                encoding="utf-8",
+            )
+            source, modes, has_activities, symmetry_filtered = _raman_mode_data(root)
+            self.assertEqual(source, path)
+            self.assertEqual(modes, [(33.3, 1.0), (66.6, 1.0)])
+            self.assertFalse(has_activities)
+            self.assertFalse(symmetry_filtered)
+            x, intensity = broaden_raman_modes(modes, linewidth_cm1=8.0, points=300)
+            self.assertEqual(len(x), 300)
+            self.assertAlmostEqual(max(intensity), 1.0)
+
+    def test_dashboard_labels_phonon_high_symmetry_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "phonon-dispersion.in").write_text(
+                "&input\n flfrc='wf.fc',\n flfrq='wf.freq',\n/\n"
+                "3\n0 0 0 2\n0.5 0 0 2\n0.5 0.5 0 1\n",
+                encoding="utf-8",
+            )
+            state = {
+                "plan": [{"id": 1, "tool": "matdyn_post"}],
+                "packages": [{"params_json": json.dumps({"parameter_guesses": {
+                    "q_path": "Gamma(0,0,0)-X(1/2,0,0)-M(1/2,1/2,0)"
+                }})}],
+            }
+            (root / "workflow_state.json").write_text(json.dumps(state), encoding="utf-8")
+            ticks = _phonon_path_ticks(
+                root,
+                [0.0, 0.25, 0.5, 0.75, 1.0],
+                [[0, 0, 0], [0.25, 0, 0], [0.5, 0, 0], [0.5, 0.25, 0], [0.5, 0.5, 0]],
+            )
+            self.assertEqual(ticks, [(0.0, r"$\Gamma$"), (0.5, "X"), (1.0, "M")])
 
     def test_dashboard_pdos_groups_species_and_orbitals(self):
         with tempfile.TemporaryDirectory() as tmp:

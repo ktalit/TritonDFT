@@ -28,6 +28,7 @@ from cluster_agent import (
     _input_validation_errors,
     _enforce_assessed_occupation_policy,
     _insert_relaxed_structure,
+    _tool_consumes_relaxed_structure,
     _enforce_workflow_artifact_names,
     _force_ph_fresh_start,
     _normalize_namelist_final_commas,
@@ -40,6 +41,7 @@ from cluster_agent import (
     _parse_resume_command,
     _is_dft_calculation_request,
     _required_parent_artifacts,
+    _declared_result_artifacts,
     _material_info_from_user_structure,
     _verified_relaxed_structure_from_state,
 )
@@ -48,7 +50,7 @@ from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce
 from execute_code.slurm_template import render_slurm_script
 from DFTAgent import DFTAgent, _generate_nonempty_text, _generate_valid_json
 from utils import normalize_qe_input_text, parse_scripts_block, write_inputs
-from workflow_state import WorkflowCheckpoint, create_checkpoint
+from workflow_state import AttemptCheckpoint, WorkflowCheckpoint, create_checkpoint
 from tool.tool_mp import (
     fetch_material_info_from_api_snippet,
     _filter_docs_by_requested_symmetry,
@@ -804,6 +806,78 @@ class _TestRemoteAgent(RemoteClusterDFTAgent):
 
 
 class ApprovalWorkflowTests(unittest.TestCase):
+    def test_recorded_submitted_job_is_reconciled_without_resubmission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            canonical_input = root / "scf.in"
+            canonical_input.write_text(PW_INPUT, encoding="utf-8")
+            plan = [{
+                "id": 2, "problem": "SCF", "tool": "pw_scf",
+                "input": "structure", "why": "ground state",
+            }]
+            packages = [{
+                "input_paths": [str(canonical_input)],
+                "output_paths": [str(root / "scf.out")],
+                "work_dir": str(root), "exec_name": "pw.x",
+                "subproblem_id": 2,
+            }]
+            state = create_checkpoint("SCF", root, plan, packages)
+            attempt_dir = root / "attempts" / "02-scf" / "attempt_001"
+            attempt_dir.mkdir(parents=True)
+            attempt_input = attempt_dir / "scf.in"
+            attempt_input.write_text(PW_INPUT, encoding="utf-8")
+            checkpoint = state.step(2)
+            checkpoint.status = "submitted"
+            checkpoint.remote_dir = "/remote/scf/attempt_001"
+            checkpoint.job_ids = ["12345"]
+            checkpoint.attempts = 1
+            checkpoint.attempt_history = [AttemptCheckpoint(
+                number=1, status="submitted", local_dir=str(attempt_dir),
+                remote_dir=checkpoint.remote_dir,
+                input_paths=[str(attempt_input)],
+                output_paths=[str(attempt_dir / "scf.out")],
+                job_ids=["12345"],
+            )]
+            state.save()
+            transport = _FakeTransport({"approved": True, "uploaded": []})
+            remote = _TestRemoteAgent(
+                _FakeAgent(root), transport, approval_callback=lambda *_args: True
+            )
+            parsed, relaxed = remote._reconcile_submitted_step(
+                query="SCF", step=plan[0], package=packages[0],
+                checkpoint=checkpoint, workflow_state=state,
+            )
+            self.assertEqual(relaxed, "")
+            self.assertEqual(parsed["judge_json"]["status"], "done")
+            self.assertEqual(checkpoint.status, "completed")
+            self.assertEqual(transport.submissions, [])
+
+    def test_vibrational_postprocessors_fetch_declared_plot_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            matdyn = root / "matdyn.in"
+            matdyn.write_text(
+                "&input\n flfrc='wf.fc',\n flfrq='wf.freq',\n/\n", encoding="utf-8"
+            )
+            dynmat = root / "dynmat.in"
+            dynmat.write_text(
+                "&input\n fildyn='wf.dynG',\n filout='wf.modes',\n/\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                _declared_result_artifacts({"tool": "matdyn_post"}, [str(matdyn)]),
+                ["wf.freq"],
+            )
+            self.assertEqual(
+                _declared_result_artifacts({"tool": "dynmat_post"}, [str(dynmat)]),
+                ["wf.modes"],
+            )
+
+    def test_phonon_tool_never_receives_relaxed_structure_placeholder(self):
+        self.assertFalse(_tool_consumes_relaxed_structure("pw_phonon_gamma"))
+        self.assertTrue(_tool_consumes_relaxed_structure("pw_scf"))
+        self.assertTrue(_tool_consumes_relaxed_structure("pw_bands"))
+        self.assertTrue(_tool_consumes_relaxed_structure("pw_nscf"))
+
     def test_semiconductor_assessment_enforces_fixed_occupations(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scf.in"

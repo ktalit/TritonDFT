@@ -17,6 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from results.electronic_reference import electronic_reference, electronic_references
 from results.evidence_qa import evaluate_calculation, evidence_prompt, merge_evidence, parse_evidence_answer, parse_retrieval_plan, retrieval_plan_prompt, search_workflow_evidence, verify_evidence, workflow_file_manifest, workflow_inventory
+from results.raman_plot import broaden_raman_modes, raman_mode_data
 from tool.structural_analysis import call_structural_analysis_tool, format_structural_tool_result
 
 
@@ -213,6 +214,122 @@ def _pdos_data(run_dir: Path):
     return (paths, series) if series else None
 
 
+def _phonon_dispersion_data(run_dir: Path):
+    """Parse the numerical frequency file written by matdyn.x."""
+    paths = sorted(
+        (path for path in run_dir.rglob("*.freq") if path.is_file()),
+        key=lambda path: (
+            "attempts" not in {part.lower() for part in path.parts},
+            -path.stat().st_mtime_ns,
+        ),
+    )
+    for path in paths:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        header = re.search(
+            r"(?is)&plot\b.*?nbnd\s*=\s*(\d+).*?nks\s*=\s*(\d+).*?/",
+            text,
+        )
+        if not header:
+            continue
+        nbnd, nks = map(int, header.groups())
+        numeric_lines = []
+        for raw in text[header.end():].splitlines():
+            try:
+                values = [float(value.replace("D", "E").replace("d", "e")) for value in raw.split()]
+            except ValueError:
+                continue
+            if values:
+                numeric_lines.append(values)
+        qpoints, frequencies = [], []
+        cursor = 0
+        for _ in range(nks):
+            if cursor >= len(numeric_lines) or len(numeric_lines[cursor]) < 3:
+                break
+            qpoints.append(numeric_lines[cursor][:3])
+            cursor += 1
+            modes = []
+            while cursor < len(numeric_lines) and len(modes) < nbnd:
+                modes.extend(numeric_lines[cursor])
+                cursor += 1
+            if len(modes) < nbnd:
+                break
+            frequencies.append(modes[:nbnd])
+        if len(qpoints) != nks or len(frequencies) != nks:
+            continue
+        distance = [0.0]
+        for previous, current in zip(qpoints, qpoints[1:]):
+            distance.append(distance[-1] + math.sqrt(sum((b - a) ** 2 for a, b in zip(previous, current))))
+        branches = [
+            [row[mode] for row in frequencies]
+            for mode in range(nbnd)
+        ]
+        return path, distance, branches, qpoints
+    return None
+
+
+def _phonon_path_labels(run_dir: Path) -> list[str]:
+    """Recover path labels from persisted matdyn parameter provenance."""
+    state_path = run_dir / "workflow_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    for step, package in zip(state.get("plan", []), state.get("packages", [])):
+        if step.get("tool") != "matdyn_post":
+            continue
+        try:
+            params = json.loads(package.get("params_json") or "{}")
+        except (ValueError, TypeError):
+            continue
+        path_text = str((params.get("parameter_guesses") or {}).get("q_path") or "")
+        labels = re.findall(r"(?:^|-)\s*([A-Za-zΓ\\]+)\s*\(", path_text)
+        if labels:
+            return [r"$\Gamma$" if label.replace("\\", "").lower() == "gamma" or label == "Γ" else label for label in labels]
+    return []
+
+
+def _phonon_path_ticks(run_dir: Path, distance: list[float], qpoints: list[list[float]]):
+    """Match documented high-symmetry nodes to the actual matdyn q sequence."""
+    labels = _phonon_path_labels(run_dir)
+    inputs = sorted(run_dir.rglob("phonon-dispersion.in"))
+    if not labels or not inputs:
+        return []
+    text = inputs[-1].read_text(encoding="utf-8", errors="replace")
+    body = text.split("/", 1)[-1].strip().splitlines()
+    try:
+        count = int(body[0].split()[0])
+    except (ValueError, IndexError):
+        return []
+    nodes = []
+    for raw in body[1:1 + count]:
+        try:
+            values = [float(value) for value in raw.split()[:3]]
+        except ValueError:
+            return []
+        if len(values) == 3:
+            nodes.append(values)
+    if len(nodes) != len(labels):
+        return []
+    ticks, start = [], 0
+    for node, label in zip(nodes, labels):
+        candidates = range(start, len(qpoints))
+        try:
+            index = min(candidates, key=lambda item: sum((qpoints[item][axis] - node[axis]) ** 2 for axis in range(3)))
+        except ValueError:
+            return []
+        mismatch = math.sqrt(sum((qpoints[index][axis] - node[axis]) ** 2 for axis in range(3)))
+        if mismatch > 1.0e-4:
+            return []
+        ticks.append((distance[index], label))
+        start = index + 1
+    return ticks
+
+
+# Backward-compatible private name used by existing tests and integrations.
+def _raman_mode_data(run_dir: Path):
+    return raman_mode_data(run_dir)
+
+
 def _float_or_none(value: str):
     value = value.strip()
     return None if not value else float(value)
@@ -392,6 +509,142 @@ class PlotPanel(ttk.Frame):
         }[self.kind]
         path = filedialog.asksaveasfilename(
             initialdir=str(self.run_dir), initialfile=f"{default}.{extension}",
+            defaultextension=f".{extension}", filetypes=[(extension.upper(), f"*.{extension}")],
+        )
+        if path:
+            self.figure.savefig(path, dpi=300, bbox_inches="tight")
+
+
+class VibrationalPlotPanel(ttk.Frame):
+    def __init__(self, parent, run_dir: Path, kind: str):
+        super().__init__(parent)
+        self.run_dir = run_dir
+        self.kind = kind
+        self.loaded_path = ""
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", padx=6, pady=6)
+        self.entries = {}
+        defaults = {"xmin": "", "xmax": "", "ymin": "", "ymax": ""}
+        if kind == "raman":
+            defaults.update({"xmin": "0", "xmax": ""})
+        for label, key in (("X min", "xmin"), ("X max", "xmax"), ("Y min", "ymin"), ("Y max", "ymax")):
+            ttk.Label(controls, text=label).pack(side="left", padx=(5, 2))
+            entry = ttk.Entry(controls, width=8)
+            entry.insert(0, defaults[key])
+            entry.pack(side="left")
+            self.entries[key] = entry
+        self.linewidth = None
+        if kind == "raman":
+            ttk.Label(controls, text="FWHM (cm⁻¹)").pack(side="left", padx=(10, 2))
+            self.linewidth = ttk.Entry(controls, width=7)
+            self.linewidth.insert(0, "8")
+            self.linewidth.pack(side="left")
+        ttk.Button(controls, text="Apply", command=self.draw).pack(side="left", padx=(10, 2))
+        ttk.Button(controls, text="Save PNG", command=lambda: self.save("png")).pack(side="left", padx=2)
+        ttk.Button(controls, text="Save PDF", command=lambda: self.save("pdf")).pack(side="left", padx=2)
+        self.note = ttk.Label(self, text="Waiting for downloaded numerical data…", wraplength=940)
+        self.note.pack(fill="x", padx=8, pady=(0, 5))
+        self.figure = self.axes = self.canvas = None
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+            self.figure = Figure(figsize=(7.4, 5.2), dpi=100)
+            self.axes = self.figure.add_subplot(111)
+            self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+            self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=6)
+        except Exception as exc:
+            self.note.configure(text=f"Matplotlib preview unavailable: {exc}")
+
+    def _source(self):
+        return _phonon_dispersion_data(self.run_dir) if self.kind == "phonons" else _raman_mode_data(self.run_dir)
+
+    def draw(self):
+        if self.axes is None:
+            return
+        try:
+            limits = {key: _float_or_none(entry.get()) for key, entry in self.entries.items()}
+        except ValueError:
+            messagebox.showerror("Invalid plot limit", "Plot limits must be numbers or blank.")
+            return
+        source = self._source()
+        if not source:
+            expected = "matdyn.x frequency" if self.kind == "phonons" else "Gamma ph.x/dynmat.x"
+            self.note.configure(text=f"No downloaded {expected} data found yet.")
+            return
+        self.axes.clear()
+        path = source[0]
+        self.loaded_path = str(path)
+        if self.kind == "phonons":
+            _path, distance, branches, qpoints = source
+            for branch in branches:
+                self.axes.plot(distance, branch, color="black", lw=0.9)
+            self.axes.axhline(0, color="tab:red", ls="--", lw=0.8)
+            ticks = _phonon_path_ticks(self.run_dir, distance, qpoints)
+            if ticks:
+                positions, labels = zip(*ticks)
+                self.axes.set_xticks(positions)
+                self.axes.set_xticklabels(labels)
+                for position in positions:
+                    self.axes.axvline(position, color="0.72", lw=0.7, zorder=0)
+                self.axes.set_xlim(positions[0], positions[-1])
+                self.axes.set_xlabel("High-symmetry q path")
+            else:
+                self.axes.set_xlabel("q-path distance")
+            self.axes.set_ylabel(r"Frequency (cm$^{-1}$)")
+            self.axes.set_title("Phonon dispersion")
+            note = f"Source: {path.name}; {len(branches)} phonon branches"
+            note += "; labeled path: " + "–".join(label.replace(r"$\Gamma$", "Γ") for _, label in ticks) if ticks else "; path labels unavailable"
+            note += "."
+        else:
+            _path, modes, has_activities, symmetry_filtered = source
+            try:
+                linewidth = float(self.linewidth.get()) if self.linewidth is not None else 8.0
+            except ValueError:
+                messagebox.showerror("Invalid linewidth", "Raman FWHM must be a positive number.")
+                return
+            if linewidth <= 0:
+                messagebox.showerror("Invalid linewidth", "Raman FWHM must be greater than zero.")
+                return
+            x, intensity = broaden_raman_modes(modes, linewidth_cm1=linewidth)
+            self.axes.plot(x, intensity, color="black", lw=1.2)
+            for frequency, _activity in modes:
+                if frequency >= 0:
+                    self.axes.axvline(frequency, color="0.65", lw=0.45, alpha=0.55)
+            self.axes.set_xlabel(r"Raman shift (cm$^{-1}$)")
+            self.axes.set_ylabel("Normalized Raman intensity")
+            self.axes.set_title("Simulated Raman spectrum")
+            note = (
+                f"Source: {path.name}; {len([mode for mode in modes if mode[0] >= 0])} "
+                f"distinct non-negative modes; Gaussian FWHM={linewidth:g} cm⁻¹. "
+                + ("Calculated Raman activities are used." if has_activities else
+                   "Activities were not present in the parsed output, so equal mode weights are used.")
+            )
+            if symmetry_filtered:
+                note += " Modes were filtered using dynmat.x Raman-active symmetry markers."
+        if limits["xmin"] is not None or limits["xmax"] is not None:
+            self.axes.set_xlim(left=limits["xmin"], right=limits["xmax"])
+        if limits["ymin"] is not None or limits["ymax"] is not None:
+            self.axes.set_ylim(bottom=limits["ymin"], top=limits["ymax"])
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+        self.note.configure(text=note)
+        settings = {**limits, "source": str(path)}
+        if self.kind == "raman" and self.linewidth is not None:
+            settings["fwhm_cm1"] = float(self.linewidth.get())
+        _write_plot_settings(self.run_dir, self.kind, settings)
+
+    def refresh_if_available(self):
+        source = self._source()
+        if source and str(source[0]) != self.loaded_path:
+            self.draw()
+
+    def save(self, extension: str):
+        if self.figure is None or not self.loaded_path:
+            messagebox.showinfo("No plot", "Wait for the numerical result before saving the plot.")
+            return
+        name = "phonon_dispersion_custom" if self.kind == "phonons" else "raman_modes_custom"
+        path = filedialog.asksaveasfilename(
+            initialdir=str(self.run_dir), initialfile=f"{name}.{extension}",
             defaultextension=f".{extension}", filetypes=[(extension.upper(), f"*.{extension}")],
         )
         if path:
@@ -646,6 +899,14 @@ def run_monitor(run_dir: Path) -> None:
     if "pdos" in capabilities:
         pdos_panel = PlotPanel(notebook, run_dir, "pdos")
         notebook.add(pdos_panel, text="PDOS")
+    phonon_panel = None
+    if "phonons" in capabilities:
+        phonon_panel = VibrationalPlotPanel(notebook, run_dir, "phonons")
+        notebook.add(phonon_panel, text="Phonon dispersion")
+    raman_panel = None
+    if "raman" in capabilities:
+        raman_panel = VibrationalPlotPanel(notebook, run_dir, "raman")
+        notebook.add(raman_panel, text="Raman")
 
     inputs_frame = ttk.Frame(notebook)
     inputs_note = ttk.Label(inputs_frame, text="Concrete input files used by workflow execution attempts.", wraplength=1040)
@@ -831,6 +1092,10 @@ def run_monitor(run_dir: Path) -> None:
             dos_panel.refresh_if_available()
         if pdos_panel is not None:
             pdos_panel.refresh_if_available()
+        if phonon_panel is not None:
+            phonon_panel.refresh_if_available()
+        if raman_panel is not None:
+            raman_panel.refresh_if_available()
         refresh_input_files()
         root.after(2000, refresh)
 

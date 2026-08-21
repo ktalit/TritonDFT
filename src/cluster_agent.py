@@ -866,6 +866,11 @@ def _add_relaxed_structure_placeholder(path: str) -> bool:
     return True
 
 
+def _tool_consumes_relaxed_structure(tool: str) -> bool:
+    """Identify downstream pw.x stages that actually contain structure cards."""
+    return tool in {"pw_scf", "pw_nscf", "pw_bands"}
+
+
 def _set_workflow_prefix(path: str, prefix: str = "tritondft_workflow") -> None:
     input_path = Path(path)
     text = input_path.read_text(encoding="utf-8")
@@ -963,6 +968,23 @@ def _required_parent_artifacts(step: Dict[str, Any], input_paths: List[str]) -> 
         filename = _input_assignment(input_path, "flfrc")
         return [Path(filename).name] if filename else []
     return []
+
+
+def _declared_result_artifacts(step: Dict[str, Any], input_paths: List[str]) -> List[str]:
+    """Return auxiliary numerical result files declared by QE postprocessors."""
+    if not input_paths:
+        return []
+    tool = str(step.get("tool") or "")
+    keys = {
+        "matdyn_post": ("flfrq", "fldos", "flvec", "fleig"),
+        "dynmat_post": ("filout", "fileig"),
+    }.get(tool, ())
+    names = []
+    for key in keys:
+        value = _input_assignment(input_paths[0], key)
+        if value:
+            names.append(Path(value).name)
+    return names
 
 
 def _stage_required_parent_artifacts(
@@ -2135,8 +2157,7 @@ class RemoteClusterDFTAgent:
             proposal = proposal_dir / Path(original).name
             proposal.write_text(new_text.rstrip() + "\n", encoding="utf-8")
             if (
-                failed.tool.startswith("pw_")
-                and failed.tool not in {"pw_relax", "pw_vc_relax"}
+                _tool_consumes_relaxed_structure(failed.tool)
                 and _verified_relaxed_structure_from_state(state)
             ):
                 if not _add_relaxed_structure_placeholder(str(proposal)):
@@ -2262,8 +2283,7 @@ class RemoteClusterDFTAgent:
                 normalize_qe_input_text(script).rstrip() + "\n", encoding="utf-8"
             )
             if (
-                failed.tool.startswith("pw_")
-                and failed.tool not in {"pw_relax", "pw_vc_relax"}
+                _tool_consumes_relaxed_structure(failed.tool)
                 and _verified_relaxed_structure_from_state(state)
                 and not _add_relaxed_structure_placeholder(str(proposal))
             ):
@@ -3254,7 +3274,11 @@ class RemoteClusterDFTAgent:
         for step_id in changed_steps:
             workflow_state.invalidate_descendants(step_id)
         for checkpoint in workflow_state.steps:
-            if checkpoint.status in {"failed", "awaiting_user", "running", "submitted"}:
+            if checkpoint.status in {"failed", "awaiting_user"}:
+                checkpoint.set_status("ready" if workflow_state.dependencies_completed(checkpoint.id) else "blocked")
+            elif checkpoint.status in {"running", "submitted"} and not checkpoint.job_ids:
+                # The process stopped before sbatch returned a job id, so there
+                # is no remote job to reconcile and a new immutable attempt is safe.
                 checkpoint.set_status("ready" if workflow_state.dependencies_completed(checkpoint.id) else "blocked")
         workflow_state.status = "running"
         workflow_state.refresh_readiness()
@@ -3315,8 +3339,7 @@ class RemoteClusterDFTAgent:
                 step_checkpoint = workflow_state.step(int(step["id"]))
                 if (
                     step_checkpoint.status != "completed"
-                    and step.get("tool", "").startswith("pw_")
-                    and step.get("tool") not in {"pw_relax", "pw_vc_relax"}
+                    and _tool_consumes_relaxed_structure(str(step.get("tool") or ""))
                 ):
                     for path in package.get("input_paths", []):
                         if not _add_relaxed_structure_placeholder(path):
@@ -3354,6 +3377,23 @@ class RemoteClusterDFTAgent:
             max_workers=max_workers,
             thread_name_prefix="tritondft-dag",
         ) as executor:
+            for step_id, (index, step, package) in indexed_steps.items():
+                checkpoint = workflow_state.step(step_id)
+                if checkpoint.status not in {"running", "submitted"} or not checkpoint.job_ids:
+                    continue
+                print(
+                    f"[resume] reconnecting to recorded Slurm job(s) for step {step_id}: "
+                    + ", ".join(checkpoint.job_ids)
+                )
+                future = executor.submit(
+                    self._reconcile_submitted_step,
+                    query=query,
+                    step=step,
+                    package=package,
+                    checkpoint=checkpoint,
+                    workflow_state=workflow_state,
+                )
+                running[future] = step_id
             while True:
                 running_ids = set(running.values())
                 ready_ids = [
@@ -3473,6 +3513,86 @@ class RemoteClusterDFTAgent:
             "download_scope": download_scope,
         }
 
+    def _reconcile_submitted_step(
+        self,
+        *,
+        query: str,
+        step: Dict[str, Any],
+        package: Dict[str, Any],
+        checkpoint,
+        workflow_state: WorkflowCheckpoint,
+    ) -> tuple[Dict[str, Any], str]:
+        """Finish a recorded Slurm attempt without submitting a duplicate job."""
+        if not checkpoint.attempt_history:
+            raise RuntimeError(
+                f"Step {checkpoint.id} records submitted jobs but has no attempt history."
+            )
+        attempt = checkpoint.attempt_history[-1]
+        local_run_dir = Path(attempt.local_dir)
+        attempt_package = dict(package)
+        attempt_package.update(
+            work_dir=str(local_run_dir),
+            input_paths=list(attempt.input_paths),
+            output_paths=list(attempt.output_paths),
+        )
+        try:
+            checkpoint.set_status("submitted")
+            attempt.status = "submitted"
+            workflow_state.save()
+            for job_id in checkpoint.job_ids:
+                self.transport.wait_for_job(ClusterJob(
+                    job_id=job_id,
+                    script_name="recorded-checkpoint-job",
+                    remote_dir=checkpoint.remote_dir,
+                    submit_output="reused from workflow checkpoint",
+                ))
+            self.transport.fetch_files(
+                checkpoint.remote_dir,
+                local_run_dir,
+                [
+                    *(Path(path).name for path in attempt_package.get("output_paths", [])),
+                    *_declared_result_artifacts(step, attempt_package.get("input_paths", [])),
+                    "CRASH", "qe.err", "qe.out",
+                ],
+            )
+            output_issues = [
+                issue
+                for output in attempt_package.get("output_paths", [])
+                for issue in validate_qe_output(
+                    output, exec_name=attempt_package.get("exec_name", "")
+                )
+                if issue.blocking
+            ]
+            if output_issues:
+                raise RuntimeError("\n".join(issue.format() for issue in output_issues))
+            new_relaxed = ""
+            if step.get("tool") == "pw_vc_relax":
+                new_relaxed = _extract_relaxed_structure(attempt_package["output_paths"][0])
+                (local_run_dir / "relaxed_structure.in").write_text(
+                    new_relaxed, encoding="utf-8"
+                )
+            parsed = self._parse_remote_step(query, step, attempt_package)
+            judge_json = parsed.get("judge_json") or {}
+            if judge_json.get("status") != "done":
+                raise RuntimeError(f"Result validation failed: {json.dumps(judge_json)}")
+            checkpoint.set_status("completed")
+            attempt.status = "completed"
+            attempt.completed_at = checkpoint.completed_at
+            workflow_state.refresh_readiness()
+            workflow_state.save()
+            print(
+                f"[resume] step {checkpoint.id} recovered from recorded Slurm job(s); "
+                "no duplicate submission was made."
+            )
+            return parsed, new_relaxed
+        except Exception as exc:
+            checkpoint.set_status("awaiting_user", str(exc))
+            attempt.status = "failed"
+            attempt.error = str(exc)
+            workflow_state.status = "awaiting_user"
+            workflow_state.save()
+            raise
+
     def _execute_resumed_step(
         self,
         *,
@@ -3536,7 +3656,9 @@ class RemoteClusterDFTAgent:
         try:
             print(f"\n[resume] step {index}/{total_steps}: {step.get('problem')}\n")
             for path in attempt_package.get("input_paths", []):
-                if relaxed_structure and step.get("tool", "").startswith("pw_") and step.get("tool") not in {"pw_relax", "pw_vc_relax"}:
+                if relaxed_structure and _tool_consumes_relaxed_structure(
+                    str(step.get("tool") or "")
+                ):
                     if not _add_relaxed_structure_placeholder(path):
                         raise RuntimeError(
                             "Could not protect the downstream geometry before inserting the relaxed structure."
@@ -3618,6 +3740,7 @@ class RemoteClusterDFTAgent:
                 local_run_dir,
                 [
                     *(Path(path).name for path in attempt_package.get("output_paths", [])),
+                    *_declared_result_artifacts(step, attempt_package.get("input_paths", [])),
                     "CRASH", "qe.err", "qe.out",
                 ],
             )
@@ -3987,6 +4110,7 @@ def interactive_main() -> None:
             try:
                 if args.fresh_start_step:
                     agent.fresh_start_step(args.resume, args.fresh_start_step)
+                _launch_workflow_monitor(args.resume)
                 resumed_state = WorkflowCheckpoint.load(args.resume)
                 if any(step.status == "awaiting_user" for step in resumed_state.steps):
                     result = agent.recovery_console(
@@ -4073,6 +4197,7 @@ def interactive_main() -> None:
                     print(f"[resume] Step {fresh_step} scheduled as a new immutable attempt.")
                 print(f"[resume] Reusing saved plan and approved inputs: {run_to_resume}")
                 print("[resume] No planning or input-generation API calls will be made.")
+                _launch_workflow_monitor(run_to_resume)
                 try:
                     result = agent.resume(run_to_resume)
                     print(json.dumps(result, indent=2))
