@@ -26,6 +26,7 @@ from cluster_agent import (
     _extract_relaxed_structure,
     _ensure_env_defaults,
     _input_validation_errors,
+    _enforce_assessed_occupation_policy,
     _insert_relaxed_structure,
     _enforce_workflow_artifact_names,
     _force_ph_fresh_start,
@@ -668,6 +669,8 @@ class _FakeAgent:
         self.parallel_np = 4
         self.parallel_exec = False
         self.hardware_description = None
+        self.max_new_tokens = 4096
+        self.remote_qe_version = "7.3.1"
         self.slurm_launcher = _FakeSlurmLauncher()
         self.run_mode = ""
         self.generated = []
@@ -801,6 +804,68 @@ class _TestRemoteAgent(RemoteClusterDFTAgent):
 
 
 class ApprovalWorkflowTests(unittest.TestCase):
+    def test_semiconductor_assessment_enforces_fixed_occupations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "scf.in"
+            path.write_text(
+                PW_INPUT.replace(
+                    " nat = 2,",
+                    " occupations='smearing',\n smearing='mv',\n degauss=0.01,\n nat = 2,",
+                ),
+                encoding="utf-8",
+            )
+            changed = _enforce_assessed_occupation_policy(
+                [{"exec_name": "pw.x", "input_paths": [str(path)]}],
+                {"occupation_policy": {
+                    "classification": "semiconductor_or_insulator",
+                    "occupations": "fixed",
+                    "confidence": "high",
+                }},
+            )
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(changed, [str(path)])
+            self.assertIn("occupations='fixed'", text)
+            self.assertNotIn("smearing=", text)
+            self.assertNotIn("degauss=", text)
+
+    def test_automatic_runtime_repair_targets_exact_failed_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "scf.in"
+            input_path.write_text(PW_INPUT, encoding="utf-8")
+            output_path = root / "scf.out"
+            plan = [{
+                "id": 7, "problem": "SCF", "tool": "pw_scf",
+                "input": "structure", "why": "ground state",
+            }]
+            packages = [{
+                "input_paths": [str(input_path)],
+                "output_paths": [str(output_path)],
+                "work_dir": str(root),
+                "exec_name": "pw.x",
+            }]
+            checkpoint = create_checkpoint("SCF calculation", root, plan, packages)
+            failed = checkpoint.step(7)
+            failed.set_status("awaiting_user", "parser error")
+            checkpoint.status = "awaiting_user"
+            checkpoint.save()
+            agent = _FakeAgent(root)
+            corrected = PW_INPUT.replace("conv_thr = 1.0d-8", "conv_thr = 1.0d-9")
+            agent.generator = lambda *_args, **_kwargs: [{
+                "generated_text": f"<scripts><script>{corrected}</script></scripts>"
+            }]
+            remote = _TestRemoteAgent(
+                agent,
+                _FakeTransport({"approved": True, "uploaded": []}),
+                approval_callback=lambda *_args: True,
+            )
+            remote._auto_repair_failed_step(checkpoint, 7, "parser error", 1)
+            self.assertIn("conv_thr = 1.0d-9", input_path.read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint.step(7).status, "ready")
+            metadata = json.loads(next((root / "recovery_proposals").glob("*/proposal.json")).read_text())
+            self.assertTrue(metadata["automatic"])
+            self.assertTrue(metadata["applied"])
+
     def test_workflow_browser_discovers_and_resolves_latest_and_number(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

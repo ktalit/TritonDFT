@@ -1130,6 +1130,49 @@ def _workflow_repair_indices(
     return fallback or list(range(len(steps)))
 
 
+def _enforce_assessed_occupation_policy(
+    packages: List[Dict[str, Any]],
+    scientific_assessment: Dict[str, Any],
+) -> List[str]:
+    """Apply a confident assessment-level occupation policy to every pw.x stage."""
+    policy = scientific_assessment.get("occupation_policy") or {}
+    classification = str(policy.get("classification") or "").strip().lower()
+    occupations = str(policy.get("occupations") or "").strip().lower()
+    confidence = str(policy.get("confidence") or "").strip().lower()
+    if not (
+        classification == "semiconductor_or_insulator"
+        and occupations == "fixed"
+        and confidence in {"high", "medium"}
+    ):
+        return []
+    changed: List[str] = []
+    for package in packages:
+        if package.get("exec_name") != "pw.x":
+            continue
+        for path_string in package.get("input_paths", []):
+            path = Path(path_string)
+            text = path.read_text(encoding="utf-8")
+            updated = re.sub(
+                r"(?mi)^([ \t]*occupations\s*=\s*)['\"]?[^,'\"\s]+['\"]?([ \t]*,?[ \t]*)$",
+                r"\1'fixed'\2",
+                text,
+            )
+            updated = re.sub(
+                r"(?mi)^[ \t]*(?:smearing|degauss)\s*=.*(?:\n|$)",
+                "",
+                updated,
+            )
+            if updated != text:
+                path.write_text(updated, encoding="utf-8")
+                changed.append(str(path))
+    if changed:
+        print(
+            "[occupation-policy] Enforced occupations='fixed' and removed smearing/degauss "
+            "for the assessed semiconductor/insulator workflow."
+        )
+    return changed
+
+
 def _isolate_branch_packages(
     run_dir: Path,
     steps: List[Dict[str, Any]],
@@ -2140,6 +2183,129 @@ class RemoteClusterDFTAgent:
         print(f"[recovery] Approved proposal {proposal_number:03d} applied; no job has been submitted yet.")
         return True
 
+    def _auto_repair_failed_step(
+        self,
+        state: WorkflowCheckpoint,
+        step_id: int,
+        error: str,
+        repair_number: int,
+    ) -> None:
+        """Generate, validate, and apply one bounded repair for an exact DAG node."""
+        failed = state.step(step_id)
+        if not failed.input_paths:
+            raise RuntimeError(f"Step {step_id} has no editable input for automatic repair.")
+        step_index = next(
+            index for index, step in enumerate(state.plan)
+            if int(step["id"]) == step_id
+        )
+        original_texts = [
+            Path(path).read_text(encoding="utf-8") for path in failed.input_paths
+        ]
+        diagnostic_sections: List[str] = []
+        if failed.attempt_history:
+            attempt_dir = Path(failed.attempt_history[-1].local_dir)
+            diagnostic_names = {
+                *(Path(path).name for path in failed.attempt_history[-1].output_paths),
+                "qe.err", "qe.out", "CRASH",
+            }
+            for name in sorted(diagnostic_names):
+                path = attempt_dir / name
+                if path.is_file() and path.stat().st_size:
+                    diagnostic_sections.append(
+                        f"DIAGNOSTIC {name}:\n"
+                        + path.read_text(encoding="utf-8", errors="replace")[-8000:]
+                    )
+        prompt = (
+            "Repair the failed Quantum ESPRESSO input using the concrete diagnostics below. "
+            "Return exactly one <scripts> block containing one <script> per current input, in "
+            "the same order, with complete plain-text QE input and no Markdown, XML CDATA, or "
+            "HTML escaping. Make the smallest correction that addresses the observed failure. "
+            "Preserve the physical task, prefix, outdir, pseudopotential/XC library, cutoffs, "
+            "vdW model, spin/SOC/DFT+U choices, dimensionality, and producer/consumer filenames. "
+            "Never invent or replace relaxed CELL_PARAMETERS or ATOMIC_POSITIONS; TritonDFT "
+            "materializes the verified final relaxation geometry separately.\n\n"
+            f"Automatic repair cycle: {repair_number}/3\n"
+            f"Remote QE version: {getattr(self.agent, 'remote_qe_version', '') or 'unknown'}\n"
+            f"Failed step: {failed.id} {failed.tool} — {failed.problem}\n"
+            f"Detected failure:\n{error[-8000:]}\n\n"
+            + "\n\n".join(diagnostic_sections)
+            + "\n\n"
+            + "\n\n".join(
+                f"CURRENT INPUT {Path(path).name}:\n{text}"
+                for path, text in zip(failed.input_paths, original_texts)
+            )
+        )
+        response = self.agent.generator(
+            prompt,
+            max_new_tokens=max(self.agent.max_new_tokens, 8192),
+            return_full_text=False,
+        )
+        generated = response[0].get("generated_text", "") if response else ""
+        scripts = parse_scripts_block(generated)
+        if len(scripts) != len(failed.input_paths):
+            raise RuntimeError(
+                f"Automatic repair returned {len(scripts)} input(s); "
+                f"expected {len(failed.input_paths)}."
+            )
+
+        proposal_root = Path(state.run_dir) / "recovery_proposals"
+        proposal_number = len(list(proposal_root.glob("proposal_*"))) + 1
+        proposal_dir = proposal_root / f"proposal_{proposal_number:03d}"
+        proposal_dir.mkdir(parents=True, exist_ok=False)
+        pseudo_source = Path(state.packages[step_index]["work_dir"]) / "pseudos"
+        if pseudo_source.is_dir():
+            shutil.copytree(pseudo_source, proposal_dir / "pseudos", dirs_exist_ok=True)
+        proposal_paths: List[str] = []
+        for original, script in zip(failed.input_paths, scripts):
+            proposal = proposal_dir / Path(original).name
+            proposal.write_text(
+                normalize_qe_input_text(script).rstrip() + "\n", encoding="utf-8"
+            )
+            if (
+                failed.tool.startswith("pw_")
+                and failed.tool not in {"pw_relax", "pw_vc_relax"}
+                and _verified_relaxed_structure_from_state(state)
+                and not _add_relaxed_structure_placeholder(str(proposal))
+            ):
+                raise RuntimeError(
+                    "Automatic repair removed the protected relaxed-structure placeholder."
+                )
+            proposal_paths.append(str(proposal))
+
+        proposed_packages = copy.deepcopy(state.packages)
+        proposed_packages[step_index]["input_paths"] = proposal_paths
+        blocking = [
+            issue for issue in validate_generated_workflow(
+                state.query, state.plan, proposed_packages
+            ) if issue.blocking
+        ]
+        metadata = {
+            "step_id": step_id,
+            "repair_cycle": repair_number,
+            "error": error,
+            "proposal_paths": proposal_paths,
+            "validation": [issue.format() for issue in blocking],
+            "automatic": True,
+            "applied": not blocking,
+        }
+        (proposal_dir / "proposal.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        if blocking:
+            raise RuntimeError(
+                "Automatic repair proposal failed deterministic validation:\n"
+                + "\n".join(issue.format() for issue in blocking)
+            )
+        for source, destination in zip(proposal_paths, failed.input_paths):
+            shutil.copy2(source, destination)
+        failed.set_status("ready")
+        state.status = "running"
+        state.save()
+        print(
+            f"[auto-repair] Step {step_id} repair {repair_number}/3 passed validation; "
+            "starting a new immutable attempt."
+        )
+
     def recovery_console(self, run_dir: str, error: str) -> Optional[Dict[str, Any]]:
         """Keep the terminal attached to a paused workflow until the user explicitly leaves it."""
         current_error = error
@@ -2673,6 +2839,7 @@ class RemoteClusterDFTAgent:
         # and before user approval. The vdW pass copies only dispersion keys,
         # so fully relativistic UPFs and SOC settings remain branch-specific.
         inherit_vdw_model(packages)
+        _enforce_assessed_occupation_policy(packages, scientific_assessment)
         harmonize_dos_integration(subproblems, packages)
         harmonize_dos_window(subproblems, packages, query)
         harmonize_nbnd(packages)
@@ -3181,6 +3348,7 @@ class RemoteClusterDFTAgent:
         # parent finishes.
         running: Dict[concurrent.futures.Future, int] = {}
         failures: List[tuple[int, Exception]] = []
+        repair_counts: Dict[int, int] = {}
         max_workers = max(1, min(8, len(indexed_steps)))
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
@@ -3226,10 +3394,42 @@ class RemoteClusterDFTAgent:
                     try:
                         parsed, new_relaxed = future.result()
                     except Exception as exc:
-                        failures.append((step_id, exc))
+                        repair_error = str(exc)
+                        repaired = False
+                        while repair_counts.get(step_id, 0) < 3:
+                            repair_counts[step_id] = repair_counts.get(step_id, 0) + 1
+                            repair_number = repair_counts[step_id]
+                            print(
+                                f"[auto-repair] Step {step_id} failed; diagnosing and "
+                                f"repairing ({repair_number}/3)."
+                            )
+                            try:
+                                self._auto_repair_failed_step(
+                                    workflow_state,
+                                    step_id,
+                                    repair_error,
+                                    repair_number,
+                                )
+                            except Exception as repair_exc:
+                                repair_error += (
+                                    f"\nAutomatic repair cycle {repair_number} failed: "
+                                    f"{repair_exc}"
+                                )
+                                print(
+                                    f"[auto-repair] Step {step_id} repair "
+                                    f"{repair_number}/3 was rejected: {repair_exc}"
+                                )
+                                continue
+                            repaired = True
+                            break
+                        if not repaired:
+                            checkpoint = workflow_state.step(step_id)
+                            checkpoint.set_status("awaiting_user", repair_error)
+                            failures.append((step_id, RuntimeError(repair_error)))
                         # Do not cancel unrelated branches. Their futures remain
                         # active, while descendants of this failed node remain
-                        # blocked by dependencies_completed().
+                        # blocked by dependencies_completed(). A validated repair
+                        # is marked ready and will be scheduled by the next pass.
                         continue
                     if new_relaxed:
                         relaxed_structure = new_relaxed

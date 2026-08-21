@@ -315,6 +315,10 @@ In particular:
 - K-point *policy* must be consistent, but meshes legitimately differ: relaxation/SCF use compatible
   uniform meshes, DOS/NSCF may be denser, and bands require an explicit symmetry path.
 - Decide vdW from dimensionality/bonding and its effect on the requested structure.
+- Classify the expected electronic character as semiconductor_or_insulator, metal, or uncertain.
+  For a confidently identified semiconductor/insulator use occupations='fixed' throughout the
+  production pw.x branch and do not add smearing/degauss merely to help relaxation. For a metal,
+  require a documented smearing type and width. If uncertain, state the uncertainty explicitly.
 - SOC is not automatically a relaxation setting merely because bands are requested. Classify SOC as
   not_needed, optional_refinement, or required. Give its scope as none, electronic_only, or
   entire_workflow. Generic structure/bands/gap/DOS requests should receive a scalar-relativistic
@@ -336,6 +340,7 @@ Required schema:
   "stage_strategy": [{{"stage": "...", "soc": "on|off", "vdw": "...", "reason": "..."}}],
   "soc_policy": {{"classification": "not_needed|optional_refinement|required", "scope": "none|electronic_only|entire_workflow", "recommended_for_requested_result": true, "reason": "..."}},
   "pseudopotential_policy": [{{"branch": "baseline|soc_refinement", "relativity": "scalar|fully_relativistic", "xc": "..."}}],
+  "occupation_policy": {{"classification": "semiconductor_or_insulator|metal|uncertain", "occupations": "fixed|smearing|explicit_decision_required", "reason": "...", "confidence": "high|medium|low"}},
   "invariants": ["..."],
   "stage_specific_parameters": ["..."],
   "approval_questions": ["..."]
