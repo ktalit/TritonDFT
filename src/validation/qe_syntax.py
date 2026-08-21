@@ -194,6 +194,22 @@ def validate_qe_syntax(path: str, exec_name: str) -> List[SyntaxFinding]:
     if not schema:
         return findings
 
+    if re.search(r"(?mi)^\s*(?:&amp;|&#0*38;|&#x0*26;)[a-z]", text):
+        findings.append(SyntaxFinding(
+            "QE_HTML_ESCAPED_NAMELIST",
+            "A QE namelist marker is HTML-escaped; use a literal '&' rather than '&amp;' or a numeric entity.",
+        ))
+    if re.search(r"(?is)<!\[CDATA\[|\]\]>", text):
+        findings.append(SyntaxFinding(
+            "QE_MARKUP_WRAPPER_PRESENT",
+            "XML CDATA markup is not valid Quantum ESPRESSO input syntax.",
+        ))
+    if re.search(r"(?m)^\s*```", text):
+        findings.append(SyntaxFinding(
+            "QE_MARKDOWN_FENCE_PRESENT",
+            "Markdown code fences are not valid Quantum ESPRESSO input syntax.",
+        ))
+
     matches = list(_NAMELIST_RE.finditer(text))
     present = [match.group(1).lower() for match in matches]
     for required in REQUIRED_NAMELISTS.get(exec_name, ()):

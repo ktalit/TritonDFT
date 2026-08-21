@@ -124,6 +124,35 @@ class WorkflowValidationTests(unittest.TestCase):
             codes = {finding.code for finding in validate_qe_syntax(str(path), "dynmat.x")}
             self.assertNotIn("QE_KEYWORD_UNKNOWN", codes)
 
+    def test_qe_syntax_blocks_html_escaped_namelist_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bands-post.in"
+            path.write_text("&amp;BANDS\n prefix='wf',\n outdir='./',\n filband='wf.band',\n/\n")
+            codes = {finding.code for finding in validate_qe_syntax(str(path), "bands.x")}
+            self.assertIn("QE_HTML_ESCAPED_NAMELIST", codes)
+            self.assertIn("QE_NAMELIST_REQUIRED", codes)
+
+    def test_qe_validation_rejects_zero_cell_and_coincident_atoms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bands.in"
+            path.write_text(
+                "&control\n calculation='bands', prefix='wf', outdir='./',\n/\n"
+                "&system\n ibrav=0, nat=2, ntyp=1, ecutwfc=40, ecutrho=320,\n/\n"
+                "&electrons\n conv_thr=1.0d-8,\n/\n"
+                "ATOMIC_SPECIES\nSi 28.085 si.upf\n"
+                "CELL_PARAMETERS (angstrom)\n0 0 0\n0 0 0\n0 0 0\n"
+                "ATOMIC_POSITIONS (crystal)\nSi 0 0 0\nSi 0 0 0\n"
+                "K_POINTS crystal_b\n2\n0 0 0 20\n0.5 0 0 1\n",
+                encoding="utf-8",
+            )
+            codes = {
+                issue.code for issue in validate_qe_input(
+                    str(path), tool="pw_bands", query="band structure"
+                )
+            }
+            self.assertIn("CELL_ZERO_VOLUME", codes)
+            self.assertIn("ATOMS_ALL_COINCIDENT", codes)
+
     def test_wrong_namelist_keyword_is_not_silently_deleted(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pw.in"

@@ -38,6 +38,19 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual(by_id[11], [10])
         self.assertEqual(by_id[12], [11])
 
+    def test_post_scf_work_cannot_run_early_when_plan_text_is_misordered(self):
+        plan = [
+            {"id": 1, "tool": "pw_bands", "problem": "bands listed too early"},
+            {"id": 2, "tool": "pw_nscf", "problem": "NSCF listed too early"},
+            {"id": 3, "tool": "pw_phonon_gamma", "problem": "Gamma phonons listed too early"},
+            {"id": 4, "tool": "pw_scf", "problem": "SCF"},
+        ]
+        dependencies = infer_dependencies(plan)
+        by_id = {step["id"]: parents for step, parents in zip(plan, dependencies)}
+        self.assertEqual(by_id[1], [4])
+        self.assertEqual(by_id[2], [4])
+        self.assertEqual(by_id[3], [4])
+
     def test_branch_classification(self):
         branches = dict(zip((step["id"] for step in self.plan), infer_branches(self.plan)))
         self.assertEqual(branches[1], "core")

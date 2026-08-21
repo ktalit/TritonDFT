@@ -1,6 +1,7 @@
 import json
 import re
 import os
+import html
 import shutil
 from pathlib import Path
 from typing import Optional, Any, Dict, List, Tuple
@@ -314,6 +315,27 @@ def _qe_input_pseudo_filenames(in_path: str) -> List[str]:
     return pp_files
 
 
+def normalize_qe_input_text(text: str) -> str:
+    """Remove transport/markup escaping without changing QE semantics."""
+    value = str(text or "").strip()
+    # LLM and web transports sometimes wrap plain inputs as a Markdown block
+    # or XML CDATA section. These wrappers are never valid QE syntax.
+    fence = re.fullmatch(r"```(?:[a-zA-Z0-9_-]+)?\s*(.*?)\s*```", value, re.DOTALL)
+    if fence:
+        value = fence.group(1).strip()
+    cdata = re.fullmatch(r"<!\[CDATA\[(.*?)\]\]>", value, re.DOTALL)
+    if cdata:
+        value = cdata.group(1).strip()
+    # Decode twice at most so doubly escaped '&amp;amp;control' is repaired,
+    # while avoiding an unbounded transformation loop.
+    for _ in range(2):
+        decoded = html.unescape(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value.strip()
+
+
 def parse_scripts_block(generated: str) -> list[str]:
     # Prefer explicit <script>...</script> tags when the model follows the
     # prompt exactly.
@@ -327,9 +349,9 @@ def parse_scripts_block(generated: str) -> list[str]:
     normalized = [(s[0] if s[0] else s[1]).strip() for s in scripts]
 
     if not normalized:
-        normalized = _fallback_script_blocks(generated)
+        normalized = _fallback_script_blocks(normalize_qe_input_text(generated))
 
-    normalized = [s.replace("\\n", "\n") for s in normalized]
+    normalized = [normalize_qe_input_text(s.replace("\\n", "\n")) for s in normalized]
 
     return normalized
 
@@ -420,6 +442,7 @@ def write_inputs(
     os.makedirs(work_dir, exist_ok=True)
     paths = []
     for idx, content in enumerate(scripts, start=1):
+        content = normalize_qe_input_text(content)
         if subproblem_id is None:
             filename = f"{prefix}_{idx}{suffix}"
         else:

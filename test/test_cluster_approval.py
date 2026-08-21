@@ -40,11 +40,13 @@ from cluster_agent import (
     _is_dft_calculation_request,
     _required_parent_artifacts,
     _material_info_from_user_structure,
+    _verified_relaxed_structure_from_state,
 )
 from execute_code.slurm import SlurmLauncher
 from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce_safe_qe_parallel_flags
 from execute_code.slurm_template import render_slurm_script
 from DFTAgent import DFTAgent, _generate_nonempty_text, _generate_valid_json
+from utils import normalize_qe_input_text, parse_scripts_block, write_inputs
 from workflow_state import WorkflowCheckpoint, create_checkpoint
 from tool.tool_mp import (
     fetch_material_info_from_api_snippet,
@@ -95,6 +97,49 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_verified_relaxed_geometry_is_reextracted_from_output_not_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "vc-relax.out"
+            output.write_text(RELAX_OUTPUT, encoding="utf-8")
+            (root / "relaxed_structure.in").write_text(
+                "CELL_PARAMETERS (angstrom)\n0 0 0\n0 0 0\n0 0 0\n",
+                encoding="utf-8",
+            )
+            attempt = types.SimpleNamespace(output_paths=[str(output)])
+            relaxation = types.SimpleNamespace(
+                status="completed", tool="pw_vc_relax", attempt_history=[attempt]
+            )
+            state = types.SimpleNamespace(steps=[relaxation], parent_run_dir="")
+            structure = _verified_relaxed_structure_from_state(state)
+            self.assertIn("5.40 0.00 0.00", structure)
+            self.assertNotIn("\n0 0 0\n", structure)
+
+    def test_generated_qe_input_decodes_html_namelist_markers(self):
+        generated = (
+            "<script>&amp;control\n calculation='scf',\n/\n"
+            "&amp;system\n ibrav=2, nat=2, ntyp=1,\n/\n"
+            "&amp;electrons\n conv_thr=1.0d-8,\n/</script>"
+        )
+        scripts = parse_scripts_block(generated)
+        self.assertTrue(scripts[0].startswith("&control"))
+        self.assertNotIn("&amp;", scripts[0])
+
+    def test_qe_input_normalizer_removes_cdata_and_markdown_wrappers(self):
+        self.assertEqual(
+            normalize_qe_input_text("```text\n&amp;BANDS\n prefix='wf',\n/\n```"),
+            "&BANDS\n prefix='wf',\n/",
+        )
+        self.assertEqual(
+            normalize_qe_input_text("<![CDATA[&amp;DOS\n prefix='wf',\n/]]>"),
+            "&DOS\n prefix='wf',\n/",
+        )
+
+    def test_write_inputs_is_a_second_html_escape_safeguard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_inputs(tmp, ["&amp;BANDS\n prefix='wf',\n/"], prefix="bands-post")[0]
+            self.assertTrue(Path(path).read_text().startswith("&BANDS"))
+
     def test_material_lookup_resolves_space_group_alias_to_number(self):
         symbol, number = _resolve_space_group_request("P63/mmc", None)
         self.assertEqual(number, 194)

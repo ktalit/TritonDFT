@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import copy
 import difflib
 import json
@@ -35,6 +36,7 @@ from utils import (
     package_pseudos_for_remote,
     preprocess_output_list,
     parse_scripts_block,
+    normalize_qe_input_text,
 )
 from vasp_agent import RemoteClusterVASPAgent, VASPAgent
 from results import extract_magnetic_moments, generate_electronic_plots
@@ -1033,6 +1035,31 @@ def _extract_relaxed_structure(output_path: str) -> str:
     return f"{cell}\n{positions}\n"
 
 
+def _verified_relaxed_structure_from_state(state: WorkflowCheckpoint) -> str:
+    """Re-extract final geometry only from a completed relaxation output."""
+    candidates = [
+        checkpoint for checkpoint in state.steps
+        if checkpoint.status == "completed"
+        and checkpoint.tool in {"pw_relax", "pw_vc_relax"}
+    ]
+    for checkpoint in reversed(candidates):
+        attempts = list(reversed(checkpoint.attempt_history))
+        for attempt in attempts:
+            for output in attempt.output_paths:
+                path = Path(output)
+                if not path.is_file():
+                    continue
+                try:
+                    return _extract_relaxed_structure(str(path))
+                except Exception:
+                    continue
+    if state.parent_run_dir:
+        return _verified_relaxed_structure_from_state(
+            WorkflowCheckpoint.load(state.parent_run_dir)
+        )
+    return ""
+
+
 def _insert_relaxed_structure(path: str, structure_block: str) -> bool:
     input_path = Path(path)
     text = input_path.read_text(encoding="utf-8")
@@ -1479,7 +1506,14 @@ def _approve_inputs_popup(
 
         def save_edits() -> None:
             for path, editor in editors.items():
-                Path(path).write_text(editor.get("1.0", "end-1c").rstrip() + "\n", encoding="utf-8")
+                clean = normalize_qe_input_text(editor.get("1.0", "end-1c"))
+                Path(path).write_text(clean.rstrip() + "\n", encoding="utf-8")
+                # Keep the visible editor synchronized with the normalized
+                # file so the user sees exactly what validation will inspect.
+                current = editor.get("1.0", "end-1c")
+                if current.rstrip() != clean.rstrip():
+                    editor.delete("1.0", "end")
+                    editor.insert("1.0", clean)
 
         def refresh_validation() -> List[str]:
             save_edits()
@@ -2021,6 +2055,8 @@ class RemoteClusterDFTAgent:
             "same order. Each script must contain the complete corrected input and no Markdown. "
             "Make only changes necessary to address the user's recovery comment and runtime error. "
             "Preserve prefix, outdir, pseudopotential/XC choices, physical task, and artifact filenames. "
+            "Never replace, invent, or numerically edit CELL_PARAMETERS or ATOMIC_POSITIONS for a "
+            "step that consumes a completed relaxation; TritonDFT inserts the verified final geometry. "
             "Do not invent unsupported executable keywords. Nothing will run automatically; the user "
             "will review the exact proposal.\n\n"
             f"Remote QE version: {version}\n"
@@ -2055,6 +2091,16 @@ class RemoteClusterDFTAgent:
         for original, old_text, new_text in zip(failed.input_paths, original_texts, scripts):
             proposal = proposal_dir / Path(original).name
             proposal.write_text(new_text.rstrip() + "\n", encoding="utf-8")
+            if (
+                failed.tool.startswith("pw_")
+                and failed.tool not in {"pw_relax", "pw_vc_relax"}
+                and _verified_relaxed_structure_from_state(state)
+            ):
+                if not _add_relaxed_structure_placeholder(str(proposal)):
+                    raise RuntimeError(
+                        "Recovery proposal removed the protected geometry and it could not be restored."
+                    )
+            new_text = proposal.read_text(encoding="utf-8")
             proposal_paths.append(str(proposal))
             diff_sections.extend(difflib.unified_diff(
                 old_text.splitlines(), new_text.splitlines(),
@@ -3088,6 +3134,28 @@ class RemoteClusterDFTAgent:
         query = workflow_state.query
         steps = workflow_state.plan
         packages = workflow_state.packages
+        relaxed_structure = _verified_relaxed_structure_from_state(workflow_state)
+        if any(
+            checkpoint.status == "completed" and checkpoint.tool in {"pw_relax", "pw_vc_relax"}
+            for checkpoint in workflow_state.steps
+        ) and not relaxed_structure:
+            raise RuntimeError(
+                "A completed relaxation is recorded, but its final coordinates cannot be re-extracted "
+                "from the completed relaxation output. Resume is blocked rather than using an input structure."
+            )
+        if relaxed_structure:
+            for step, package in zip(steps, packages):
+                step_checkpoint = workflow_state.step(int(step["id"]))
+                if (
+                    step_checkpoint.status != "completed"
+                    and step.get("tool", "").startswith("pw_")
+                    and step.get("tool") not in {"pw_relax", "pw_vc_relax"}
+                ):
+                    for path in package.get("input_paths", []):
+                        if not _add_relaxed_structure_placeholder(path):
+                            raise RuntimeError(
+                                f"Could not restore the protected relaxed-structure placeholder in {path}."
+                            )
         issues = validate_generated_workflow(query, steps, packages)
         blocking = [issue for issue in issues if issue.blocking]
         if blocking:
@@ -3096,52 +3164,86 @@ class RemoteClusterDFTAgent:
                 + "\n".join(issue.format() for issue in blocking)
             )
 
-        relaxed_structure = ""
-        completed_relax = next(
-            (
-                checkpoint for checkpoint in workflow_state.steps
-                if checkpoint.status == "completed"
-                and checkpoint.tool in {"pw_relax", "pw_vc_relax"}
-                and checkpoint.attempt_history
-            ),
-            None,
-        )
-        if completed_relax is not None:
-            relaxed_path = Path(completed_relax.attempt_history[-1].local_dir) / "relaxed_structure.in"
-            if relaxed_path.is_file():
-                relaxed_structure = relaxed_path.read_text(encoding="utf-8")
-        if not relaxed_structure:
-            imported_relaxed = Path(workflow_state.run_dir) / "imported_relaxed_structure.in"
-            if imported_relaxed.is_file():
-                relaxed_structure = imported_relaxed.read_text(encoding="utf-8")
-
         results: List[Dict[str, Any]] = []
         conclusions: List[str] = []
-        for index, (step, package) in enumerate(zip(steps, packages), start=1):
-            checkpoint = workflow_state.step(int(step["id"]))
-            if checkpoint.status == "completed":
+        indexed_steps = {
+            int(step["id"]): (index, step, package)
+            for index, (step, package) in enumerate(zip(steps, packages), start=1)
+        }
+        for step_id, (index, _step, _package) in indexed_steps.items():
+            if workflow_state.step(step_id).status == "completed":
                 print(f"[resume] step {index}/{len(steps)} completed; reusing it.")
-                continue
-            if not workflow_state.dependencies_completed(checkpoint.id):
-                checkpoint.set_status("blocked", "Waiting for an incomplete dependency.")
-                workflow_state.save()
-                continue
-            parsed, new_relaxed = self._execute_resumed_step(
-                query=query,
-                index=index,
-                total_steps=len(steps),
-                step=step,
-                package=package,
-                checkpoint=checkpoint,
-                workflow_state=workflow_state,
-                relaxed_structure=relaxed_structure,
-            )
-            if new_relaxed:
-                relaxed_structure = new_relaxed
-            results.append(parsed)
-            prose = self.agent._judge_prose(parsed.get("result_judge", ""))
-            if prose:
-                conclusions.append(f"Step {index}: {prose}")
+
+        # A job becomes eligible only after every declared parent has reached
+        # "completed".  This keeps relax -> SCF strictly sequential, then lets
+        # bands, NSCF, phonons, and other independent post-SCF branches run at
+        # the same time.  Descendants are released independently as their own
+        # parent finishes.
+        running: Dict[concurrent.futures.Future, int] = {}
+        failures: List[tuple[int, Exception]] = []
+        max_workers = max(1, min(8, len(indexed_steps)))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="tritondft-dag",
+        ) as executor:
+            while True:
+                running_ids = set(running.values())
+                ready_ids = [
+                    step_id
+                    for step_id in indexed_steps
+                    if step_id not in running_ids
+                    and workflow_state.step(step_id).status != "completed"
+                    and workflow_state.step(step_id).status not in {"awaiting_user", "failed", "cancelled"}
+                    and workflow_state.dependencies_completed(step_id)
+                ]
+                for step_id in ready_ids:
+                    index, step, package = indexed_steps[step_id]
+                    checkpoint = workflow_state.step(step_id)
+                    checkpoint.set_status("ready")
+                    workflow_state.save()
+                    future = executor.submit(
+                        self._execute_resumed_step,
+                        query=query,
+                        index=index,
+                        total_steps=len(steps),
+                        step=step,
+                        package=package,
+                        checkpoint=checkpoint,
+                        workflow_state=workflow_state,
+                        relaxed_structure=relaxed_structure,
+                    )
+                    running[future] = step_id
+
+                if not running:
+                    break
+
+                done, _pending = concurrent.futures.wait(
+                    running, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    step_id = running.pop(future)
+                    index, _step, _package = indexed_steps[step_id]
+                    try:
+                        parsed, new_relaxed = future.result()
+                    except Exception as exc:
+                        failures.append((step_id, exc))
+                        # Do not cancel unrelated branches. Their futures remain
+                        # active, while descendants of this failed node remain
+                        # blocked by dependencies_completed().
+                        continue
+                    if new_relaxed:
+                        relaxed_structure = new_relaxed
+                    results.append(parsed)
+                    prose = self.agent._judge_prose(parsed.get("result_judge", ""))
+                    if prose:
+                        conclusions.append(f"Step {index}: {prose}")
+
+        workflow_state.refresh_readiness()
+        if failures:
+            workflow_state.status = "awaiting_user"
+            workflow_state.save()
+            failed_step, error = failures[0]
+            raise RuntimeError(f"Step {failed_step} failed: {error}") from error
 
         if any(step.status != "completed" for step in workflow_state.steps):
             workflow_state.status = "awaiting_user"
@@ -3234,11 +3336,15 @@ class RemoteClusterDFTAgent:
         try:
             print(f"\n[resume] step {index}/{total_steps}: {step.get('problem')}\n")
             for path in attempt_package.get("input_paths", []):
-                text = Path(path).read_text(encoding="utf-8")
-                if "TRITONDFT_RELAXED_STRUCTURE_PLACEHOLDER_BEGIN" in text:
-                    if not relaxed_structure:
-                        raise RuntimeError("Relaxed structure is not available for this dependent step.")
-                    _insert_relaxed_structure(path, relaxed_structure)
+                if relaxed_structure and step.get("tool", "").startswith("pw_") and step.get("tool") not in {"pw_relax", "pw_vc_relax"}:
+                    if not _add_relaxed_structure_placeholder(path):
+                        raise RuntimeError(
+                            "Could not protect the downstream geometry before inserting the relaxed structure."
+                        )
+                    if not _insert_relaxed_structure(path, relaxed_structure):
+                        raise RuntimeError(
+                            "Could not insert the verified final relaxation geometry into the downstream input."
+                        )
                     if step.get("tool") == "pw_bands":
                         try:
                             labels = materialize_relaxed_band_path(path, relaxed_structure)

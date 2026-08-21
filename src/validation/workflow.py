@@ -287,6 +287,25 @@ def validate_qe_input(path: str, *, tool: str = "", query: str = "") -> List[Val
             _, cell = _card_rows(text, "CELL_PARAMETERS")
             if len(cell) != 3:
                 add("fatal", "CELL_INVALID", "ibrav=0 requires exactly three CELL_PARAMETERS rows.")
+            else:
+                try:
+                    vectors = [[float(value) for value in row.split()[:3]] for row in cell]
+                    determinant = (
+                        vectors[0][0] * (vectors[1][1] * vectors[2][2] - vectors[1][2] * vectors[2][1])
+                        - vectors[0][1] * (vectors[1][0] * vectors[2][2] - vectors[1][2] * vectors[2][0])
+                        + vectors[0][2] * (vectors[1][0] * vectors[2][1] - vectors[1][1] * vectors[2][0])
+                    )
+                    if abs(determinant) < 1.0e-10:
+                        add("fatal", "CELL_ZERO_VOLUME", "CELL_PARAMETERS define a zero-volume or singular cell.")
+                except (ValueError, IndexError):
+                    add("fatal", "CELL_INVALID", "CELL_PARAMETERS rows must contain three numeric vectors.")
+        if positions and len(positions) > 1:
+            try:
+                coordinates = [tuple(float(value) for value in row.split()[1:4]) for row in positions]
+                if len(set(coordinates)) == 1:
+                    add("fatal", "ATOMS_ALL_COINCIDENT", "All atoms have identical coordinates; refusing an invented or corrupted structure.")
+            except (ValueError, IndexError):
+                pass
 
         k_kind, k_rows = _card_rows(text, "K_POINTS")
         if "crystal_b" in k_kind:

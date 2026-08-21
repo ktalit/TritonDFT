@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,12 @@ STEP_STATES = {
     "pending", "ready", "submitted", "running", "completed", "failed",
     "repairing", "awaiting_user", "blocked", "cancelled",
 }
+
+
+# Several independent DAG branches may finish at nearly the same time.  Keep the
+# checkpoint replacement atomic within this process so concurrent workers never
+# overwrite or replace the same temporary file simultaneously.
+_CHECKPOINT_SAVE_LOCK = threading.RLock()
 
 
 def _now() -> str:
@@ -92,11 +99,12 @@ class WorkflowCheckpoint:
         return Path(self.run_dir) / "workflow_state.json"
 
     def save(self) -> None:
-        self.updated_at = _now()
-        payload = json.dumps(asdict(self), indent=2) + "\n"
-        temporary = self.path.with_suffix(".json.tmp")
-        temporary.write_text(payload, encoding="utf-8")
-        temporary.replace(self.path)
+        with _CHECKPOINT_SAVE_LOCK:
+            self.updated_at = _now()
+            payload = json.dumps(asdict(self), indent=2) + "\n"
+            temporary = self.path.with_suffix(".json.tmp")
+            temporary.write_text(payload, encoding="utf-8")
+            temporary.replace(self.path)
 
     def step(self, step_id: int) -> StepCheckpoint:
         for checkpoint in self.steps:
@@ -176,6 +184,7 @@ class WorkflowCheckpoint:
 def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
     """Infer artifact dependencies from the normalized subproblem sequence."""
     dependencies: List[List[int]] = []
+    scf_ids = [int(step["id"]) for step in steps if str(step.get("tool") or "") == "pw_scf"]
     last_relax: Optional[int] = None
     last_scf: Optional[int] = None
     last_bands: Optional[int] = None
@@ -195,22 +204,25 @@ def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
                 parents = [last_relax]
             last_scf = step_id
         elif tool == "pw_bands":
-            if last_scf is not None:
-                parents = [last_scf]
+            scf_parent = last_scf if last_scf is not None else (scf_ids[0] if scf_ids else None)
+            if scf_parent is not None:
+                parents = [scf_parent]
             last_bands = step_id
         elif tool == "bands_post":
             if last_bands is not None:
                 parents = [last_bands]
         elif tool == "pw_nscf":
-            if last_scf is not None:
-                parents = [last_scf]
+            scf_parent = last_scf if last_scf is not None else (scf_ids[0] if scf_ids else None)
+            if scf_parent is not None:
+                parents = [scf_parent]
             last_nscf = step_id
         elif tool in {"dos_post", "projwfc_post"}:
             if last_nscf is not None:
                 parents = [last_nscf]
         elif tool == "pw_phonon_gamma":
-            if last_scf is not None:
-                parents = [last_scf]
+            scf_parent = last_scf if last_scf is not None else (scf_ids[0] if scf_ids else None)
+            if scf_parent is not None:
+                parents = [scf_parent]
             if "dispersion" in problem or "q-grid" in problem or "q grid" in problem or "q-point mesh" in problem:
                 last_grid_ph = step_id
             else:
