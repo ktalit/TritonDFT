@@ -108,20 +108,19 @@ bash scripts/run_cluster_agent.sh
 ```
 
 On the first run for each Linux user, TritonDFT checks that the user's own
-cluster setup exists. If `~/.tritondft/.env.cluster` is missing, incomplete, or
+cluster setup exists. If the project-local `.tritondft/.env.cluster` is missing, incomplete, or
 points to an SSH alias that is not present in that user's `~/.ssh/config`,
 TritonDFT asks for the cluster nickname, login hostname, cluster user id, and
 remote working directory. It then creates/reuses that user's SSH config entry,
-writes the cluster defaults to `~/.tritondft/.env.cluster`, and asks the user to
+writes the cluster defaults to `.tritondft/.env.cluster`, and asks the user to
 add `OPENAI_API_KEY` and `MP_API_KEY` before continuing.
 
-Each user should keep their own Slurm example script at
-`~/.tritondft/example_slurm_job_file.txt` and edit it with their cluster's
+Each user keeps separate QE and VASP Slurm templates at
+`.tritondft/example_qe_slurm_job_file.txt` and
+`.tritondft/example_vasp_slurm_job_file.txt`. Edit them with the cluster's
 normal account, partition, submission header, and module commands. TritonDFT
-uses that file as the safe site-specific base and only replaces the walltime,
-Slurm task count, executable, input, output, and QE launch command for each
-generated job. On first run, if the user-local template is missing, TritonDFT
-copies the shared `example_slurm_job_file.txt` there as a starting point.
+creates both starter files automatically and uses the appropriate one for each
+generated job.
 
 The `.env.cluster` file is ignored by Git because it can contain API keys. The
 `CLUSTER_AGENT_SSH_TARGET` value can be an alias from `~/.ssh/config` or
@@ -136,9 +135,10 @@ add `--remote-qe-bin-dir /path/to/qe/bin`.
 The agent chooses the Slurm walltime and parallel launch settings from the
 generated QE input.
 Any command-line option still overrides the value from `.env.cluster`.
-For centrally managed workshops, TritonDFT can first load administrator defaults
-from `/opt/tritondft/config/.env.cluster_admin` (or `TRITONDFT_ADMIN_ENV`) and
-then apply an optional user `.env.cluster` as an override. See
+For centrally managed workshops, TritonDFT can load administrator defaults from
+`/opt/tritondft/config/.env.cluster_admin` (or `TRITONDFT_ADMIN_ENV`). Setting
+`TRITONDFT_ADMIN_LOCK_PROVIDER=true` there prevents personal env files and CLI
+options from overriding the administrator's API keys, backend, and model. See
 `CLUSTER_INSTALL.md`; never commit the populated administrator file.
 Type `exit` or `quit` at the `DFT request>` prompt to stop the loop.
 

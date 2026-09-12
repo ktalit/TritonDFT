@@ -1,4 +1,7 @@
 import re, ast
+import warnings
+from contextlib import contextmanager
+from collections.abc import Mapping
 from typing import Dict, Any, List, Optional
 
 
@@ -17,6 +20,47 @@ def _as_structure(x):
     if isinstance(x, dict):
         return Structure.from_dict(x)
     return x
+
+
+def _doc_value(doc: Any, field: str, default: Any = None) -> Any:
+    """Read an MP response without invoking its deprecated dict interface.
+
+    ``mp-api`` returns attribute-based emmet document models by default, while
+    ``use_document_model=False`` returns ordinary mappings. Supporting both at
+    this boundary keeps the rest of the material-selection code independent of
+    the installed mp-api/emmet-core version.
+    """
+    if isinstance(doc, dict):
+        return doc.get(field, default)
+    missing = object()
+    value = getattr(doc, field, missing)
+    if value is not missing:
+        return value
+    if isinstance(doc, Mapping):
+        return doc[field] if field in doc else default
+    return default
+
+
+@contextmanager
+def _pymatgen_spglib_compatibility():
+    """Silence only known warnings from old pymatgen with current dependencies."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"dict interface is deprecated\. Use attribute interface instead",
+            category=DeprecationWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Set OLD_ERROR_HANDLING to false and catch the errors directly\.",
+            category=DeprecationWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r"gcd is deprecated, and will be removed on 2028-01-01",
+            category=FutureWarning,
+        )
+        yield
 
 
 # ---------- Helper extraction functions ----------
@@ -78,14 +122,15 @@ def _filter_docs_by_requested_symmetry(
         return docs
     matched = []
     for doc in docs:
-        structure = _as_structure(doc.get("structure"))
+        structure = _as_structure(_doc_value(doc, "structure"))
         if structure is None:
             continue
         try:
-            analyzer = analyzer_cls(structure, symprec=1e-3, angle_tolerance=5)
-            actual_symbol = analyzer.get_space_group_symbol()
-            actual_number = analyzer.get_space_group_number()
-            actual_point_group = analyzer.get_point_group_symbol()
+            with _pymatgen_spglib_compatibility():
+                analyzer = analyzer_cls(structure, symprec=1e-3, angle_tolerance=5)
+                actual_symbol = analyzer.get_space_group_symbol()
+                actual_number = analyzer.get_space_group_number()
+                actual_point_group = analyzer.get_point_group_symbol()
         except Exception:
             continue
         # A resolved number supersedes textual comparison. This accepts valid
@@ -204,18 +249,18 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     ranked_docs = sorted(
         docs,
         key=lambda doc: (
-            float("inf") if doc.get("energy_above_hull") is None
-            else float(doc["energy_above_hull"]),
-            str(doc.get("material_id", "")),
+            float("inf") if _doc_value(doc, "energy_above_hull") is None
+            else float(_doc_value(doc, "energy_above_hull")),
+            str(_doc_value(doc, "material_id", "")),
         ),
     )
     selected_doc = ranked_docs[0]
-    min_id = selected_doc["material_id"]
+    min_id = _doc_value(selected_doc, "material_id")
     ehull_min = (
-        float(selected_doc["energy_above_hull"])
-        if selected_doc.get("energy_above_hull") is not None else float("inf")
+        float(_doc_value(selected_doc, "energy_above_hull"))
+        if _doc_value(selected_doc, "energy_above_hull") is not None else float("inf")
     )
-    retrieved_structure = _as_structure(selected_doc.get("structure"))
+    retrieved_structure = _as_structure(_doc_value(selected_doc, "structure"))
 
     # Step 4. Fetch initial-structure history only for the selected record.
     # use_document_model=False -> raw dicts, bypassing emmet-core's MPID
@@ -238,20 +283,21 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
         "primitive_structure": [],
     }
 
-    mdoc = next((item for item in mats if item.get("material_id") == min_id), None)
+    mdoc = next(
+        (item for item in mats if _doc_value(item, "material_id") == min_id),
+        None,
+    )
     available_initials = []
-    if mdoc and mdoc.get("initial_structures"):
-        available_initials = [_as_structure(item) for item in mdoc["initial_structures"]]
+    initial_structures = _doc_value(mdoc, "initial_structures", []) if mdoc else []
+    if initial_structures:
+        available_initials = [_as_structure(item) for item in initial_structures]
     if retrieved_structure is None:
         raise ValueError("Materials Project returned records but no usable periodic structure.")
     # 使用 SpacegroupAnalyzer 进行标准化处理
-    sga = SpacegroupAnalyzer(retrieved_structure)
-
-    # 1. 获取真正的原始胞 (LiNbO3 应该是 10 原子的那个)
-    primitive = sga.get_primitive_standard_structure() 
-
-    # 2. 获取常规胞 (LiNbO3 应该是 30 原子的那个)
-    conventional = sga.get_conventional_standard_structure()
+    with _pymatgen_spglib_compatibility():
+        sga = SpacegroupAnalyzer(retrieved_structure)
+        primitive = sga.get_primitive_standard_structure()
+        conventional = sga.get_conventional_standard_structure()
 
     # 存入结果
     result["primitive_structure"].append(primitive)
@@ -261,17 +307,18 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     # Some MP records do not expose an initial-structure history. The summary
     # endpoint structure is still a valid database starting geometry and must
     # keep the workflow usable rather than raising KeyError here.
-    if available_initials:
-        result["initial_structures"].append(available_initials[0].to(fmt="cif"))
-    else:
-        result["initial_structures"].append(retrieved_structure.to(fmt="cif"))
+    with _pymatgen_spglib_compatibility():
+        if available_initials:
+            result["initial_structures"].append(available_initials[0].to(fmt="cif"))
+        else:
+            result["initial_structures"].append(retrieved_structure.to(fmt="cif"))
     result["relaxed_structures"].append(retrieved_structure)
     # result["conventional_structure"].append(conventional)
     # result["primitive_structure"].append(primitive)
 
     gt = {}
     try:
-        s = relaxed_lookup.get(min_id)
+        s = retrieved_structure
         if s is not None:
             lat = s.lattice
             gt["a"] = lat.a
@@ -281,11 +328,12 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
             gt["beta"] = lat.beta
             gt["gamma"] = lat.gamma
             try:
-                sga = SpacegroupAnalyzer(s, symprec=1e-3, angle_tolerance=5)
-                gt["space_group"] = sga.get_space_group_symbol()
-                gt["space_group_number"] = sga.get_space_group_number()
-                gt["point_group"] = sga.get_point_group_symbol()
-                gt["crystal_system"] = sga.get_crystal_system()
+                with _pymatgen_spglib_compatibility():
+                    sga = SpacegroupAnalyzer(s, symprec=1e-3, angle_tolerance=5)
+                    gt["space_group"] = sga.get_space_group_symbol()
+                    gt["space_group_number"] = sga.get_space_group_number()
+                    gt["point_group"] = sga.get_point_group_symbol()
+                    gt["crystal_system"] = sga.get_crystal_system()
             except Exception:
                 pass
     except Exception:
@@ -298,7 +346,8 @@ def fetch_material_info_from_api_snippet(snippet: str, limit: int = 25, verbose:
     # caller instead, and surfaced behind a "details" toggle in the UI.
     summary = {"material_id": min_id}
     try:
-        summary["formula"] = primitive.composition.reduced_formula
+        with _pymatgen_spglib_compatibility():
+            summary["formula"] = primitive.composition.reduced_formula
         summary["n_sites_primitive"] = len(primitive)
         summary["n_sites_conventional"] = len(conventional)
     except Exception:

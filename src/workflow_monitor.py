@@ -18,10 +18,19 @@ from tkinter import filedialog, messagebox, ttk
 from results.electronic_reference import electronic_reference, electronic_references
 from results.evidence_qa import evaluate_calculation, evidence_prompt, merge_evidence, parse_evidence_answer, parse_retrieval_plan, retrieval_plan_prompt, search_workflow_evidence, verify_evidence, workflow_file_manifest, workflow_inventory
 from results.raman_plot import broaden_raman_modes, raman_mode_data
+from results.workflow_qa import answer_workflow_question
 from tool.structural_analysis import call_structural_analysis_tool, format_structural_tool_result
 
 
 VESTA_DOWNLOAD_URL = "https://jp-minerals.org/vesta/en/download.html"
+
+
+def _display_step_status(step: dict) -> str:
+    """Do not claim scheduler execution before Slurm has assigned a job ID."""
+    status = str(step.get("status") or "pending")
+    if status == "running" and not step.get("job_ids"):
+        return "preparing"
+    return status
 
 
 def _workflow_capabilities(run_dir: Path) -> set[str]:
@@ -44,13 +53,16 @@ def _workflow_capabilities(run_dir: Path) -> set[str]:
             steps = []
 
     if steps:
-        tools = {str(step.get("tool") or "").strip().lower() for step in steps}
+        tools = {
+            str(step.get("tool") or step.get("task") or "").strip().lower()
+            for step in steps
+        }
         capabilities = set()
-        if tools & {"pw_relax", "pw_vc_relax"}:
+        if tools & {"pw_relax", "pw_vc_relax", "relax", "vc-relax"}:
             capabilities.add("structure")
-        if tools & {"pw_bands", "bands_post"}:
+        if tools & {"pw_bands", "bands_post", "bands"}:
             capabilities.add("bands")
-        if tools & {"dos_post"}:
+        if tools & {"dos_post", "dos"}:
             capabilities.add("dos")
         if tools & {"projwfc_post"}:
             capabilities.add("pdos")
@@ -75,6 +87,10 @@ def _calculation_input_files(run_dir: Path) -> list[Path]:
     """Inputs actually materialized for execution, with sensible fallbacks."""
     all_inputs = [path for path in sorted(run_dir.rglob("*.in"))
                   if path.is_file() and not any(part.endswith(".save") for part in path.parts)]
+    all_inputs.extend(
+        path for path in sorted(run_dir.rglob("*"))
+        if path.is_file() and path.name in {"POSCAR", "INCAR", "KPOINTS"}
+    )
     attempted = [path for path in all_inputs if "attempts" in {part.lower() for part in path.parts}]
     if attempted:
         return attempted
@@ -654,8 +670,21 @@ class VibrationalPlotPanel(ttk.Frame):
 def _structure_text(run_dir: Path) -> str:
     candidates = sorted(run_dir.rglob("relaxed_structure.in"))
     if not candidates:
+        candidates = [path for path in sorted(run_dir.rglob("CONTCAR")) if path.stat().st_size > 0]
+    if not candidates:
         return "Relaxed structure has not been downloaded yet.\n"
     text = candidates[-1].read_text(encoding="utf-8", errors="replace")
+    if candidates[-1].name == "CONTCAR":
+        try:
+            from pymatgen.core import Structure
+            structure = Structure.from_file(candidates[-1])
+            lattice = structure.lattice
+            return (
+                f"Lattice lengths: a={lattice.a:.6f} Å, b={lattice.b:.6f} Å, c={lattice.c:.6f} Å\n"
+                f"Cell volume: {lattice.volume:.6f} Å³\n\n{text}"
+            )
+        except Exception:
+            return text
     rows = re.search(r"(?mis)CELL_PARAMETERS\s*\([^)]*\)\s*\n([^\n]+)\n([^\n]+)\n([^\n]+)", text)
     summary = []
     if rows:
@@ -676,6 +705,8 @@ def _structure_text(run_dir: Path) -> str:
 
 def _relaxed_structure_path(run_dir: Path) -> Path | None:
     candidates = sorted(run_dir.rglob("relaxed_structure.in"))
+    if not candidates:
+        candidates = [path for path in sorted(run_dir.rglob("CONTCAR")) if path.stat().st_size > 0]
     return candidates[-1] if candidates else None
 
 
@@ -683,9 +714,13 @@ def _relaxed_structure_to_cif(run_dir: Path, destination: Path | None = None) ->
     source = _relaxed_structure_path(run_dir)
     if source is None:
         raise FileNotFoundError("The relaxed structure has not been downloaded.")
-    from structure_paths import _parse_relaxed_structure
     from pymatgen.io.cif import CifWriter
-    structure = _parse_relaxed_structure(source.read_text(encoding="utf-8", errors="replace"))
+    if source.name == "CONTCAR":
+        from pymatgen.core import Structure
+        structure = Structure.from_file(source)
+    else:
+        from structure_paths import _parse_relaxed_structure
+        structure = _parse_relaxed_structure(source.read_text(encoding="utf-8", errors="replace"))
     target = destination or (run_dir / "relaxed_structure.cif")
     target.parent.mkdir(parents=True, exist_ok=True)
     # Write explicitly in text mode; recent monty versions reject pymatgen's
@@ -983,61 +1018,10 @@ def run_monitor(run_dir: Path) -> None:
 
     def ask_worker(question: str, include_failed: bool) -> None:
         try:
-            structural = call_structural_analysis_tool(run_dir, question)
-            if structural is not None:
-                output = format_structural_tool_result(structural)
-                root.after(0, lambda value=output: finish_ask(value, "Answered by the deterministic pymatgen structural-analysis tool."))
-                return
-            from generator import UnifiedGenerator
-            generator = UnifiedGenerator(model=os.environ.get("CLUSTER_AGENT_MODEL", "gpt-4o"), backend=os.environ.get("CLUSTER_AGENT_BACKEND", "auto"), temperature=0.0)
-            inventory = workflow_inventory(run_dir)
-            manifest = workflow_file_manifest(run_dir, include_failed=include_failed)
-            plan_response = generator(
-                retrieval_plan_prompt(question, inventory, manifest), max_new_tokens=450
-            )
-            plan_raw = plan_response[0].get("generated_text", "") if plan_response else ""
-            retrieval_queries = parse_retrieval_plan(plan_raw)
-            groups = [search_workflow_evidence(
+            output, status = answer_workflow_question(
                 run_dir, question, include_failed=include_failed
-            )]
-            for retrieval_query in retrieval_queries:
-                groups.append(search_workflow_evidence(
-                    run_dir, retrieval_query, limit=12, include_failed=include_failed
-                ))
-            evidence = merge_evidence(groups)
-            if not evidence:
-                root.after(0, lambda: finish_ask("I could not find relevant evidence in the downloaded workflow files. This question cannot be answered from the available calculation record.", "No supporting lines found."))
-                return
-            response = generator(
-                evidence_prompt(question, evidence, inventory), max_new_tokens=1100
             )
-            raw = response[0].get("generated_text", "") if response else ""
-            parsed = parse_evidence_answer(raw, {item.evidence_id for item in evidence})
-            by_id = {item.evidence_id: item for item in evidence}
-            cited = [by_id[item_id] for item_id in parsed["evidence_ids"] if verify_evidence(by_id[item_id])]
-            if cited:
-                output = (
-                    f"Answer ({parsed['answer_type'].capitalize()})\n{parsed['answer']}\n\n"
-                    f"Confidence: {parsed['confidence']}\n"
-                )
-                if parsed["derivation"]:
-                    output += f"\nDerivation / interpretation\n{parsed['derivation']}\n"
-                expression = parsed["calculation"]["expression"]
-                if expression:
-                    try:
-                        calculated = evaluate_calculation(expression)
-                        description = parsed["calculation"]["description"] or "calculated value"
-                        unit = parsed["calculation"]["unit"]
-                        output += f"\nTritonDFT calculated result\n{description}: {calculated:.10g}{(' ' + unit) if unit else ''}\nExpression: {expression}\n"
-                    except (ValueError, ArithmeticError) as exc:
-                        output += f"\nCalculation was not accepted: {exc}\n"
-                output += "\nVerified supporting evidence\n"
-            else:
-                output = "The model did not provide a verifiable citation, so its proposed answer was not accepted.\n\nMost relevant verified source lines:\n"
-                cited = [item for item in evidence[:5] if verify_evidence(item)]
-            for item in cited:
-                output += f"\n[{item.evidence_id}] {item.path}:{item.line_number}\n{item.line}\n"
-            root.after(0, lambda value=output: finish_ask(value, "Answer completed from workflow-local evidence."))
+            root.after(0, lambda value=output, label=status: finish_ask(value, label))
         except Exception as exc:
             root.after(0, lambda value=str(exc): finish_ask(f"The evidence search completed, but the LLM answer could not be generated.\n\n{value}", "Question failed; no unsupported answer was shown."))
 
@@ -1073,7 +1057,9 @@ def run_monitor(run_dir: Path) -> None:
             for item in tree.get_children():
                 tree.delete(item)
             for step in state.get("steps", []):
-                tree.insert("", "end", values=(step.get("id"), step.get("problem"), step.get("branch"), step.get("status"), step.get("attempts", 0), ", ".join(step.get("job_ids", []))))
+                display_status = _display_step_status(step)
+                attempts = 0 if display_status == "preparing" and not step.get("job_ids") else step.get("attempts", 0)
+                tree.insert("", "end", values=(step.get("id"), step.get("problem"), step.get("branch"), display_status, attempts, ", ".join(step.get("job_ids", []))))
             status_label.configure(text=f"Workflow: {state.get('status', 'unknown')}   Updated: {state.get('updated_at', '')}")
             waiting = next((step for step in state.get("steps", []) if step.get("status") == "awaiting_user"), None)
             error_label.configure(text=(f"Terminal awaiting recovery instruction for step {waiting.get('id')}.\nLatest error: {waiting.get('last_error', '')}" if waiting else ""))

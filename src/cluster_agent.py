@@ -38,15 +38,26 @@ from utils import (
     parse_scripts_block,
     normalize_qe_input_text,
 )
-from vasp_agent import RemoteClusterVASPAgent, VASPAgent
+from vasp_agent import RemoteClusterVASPAgent, VASPAgent, _approve_vasp_inputs_popup
 from results import extract_magnetic_moments, generate_electronic_plots
 from structure_paths import materialize_relaxed_band_path
 from workflow_state import AttemptCheckpoint, WorkflowCheckpoint, create_checkpoint, file_sha256, infer_branches, infer_dependencies
 from workflow_context import WorkflowContext, create_workflow_context
+from dashboard_mode import BrowserDashboardSession, dashboard_mode
+from dashboard_activity import append_activity
 
 
-DEFAULT_USER_QE_SLURM_TEMPLATE = "~/.tritondft/example_qe_slurm_job_file.txt"
-DEFAULT_USER_VASP_SLURM_TEMPLATE = "~/.tritondft/example_vasp_slurm_job_file.txt"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_USER_QE_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_qe_slurm_job_file.txt")
+DEFAULT_USER_VASP_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_vasp_slurm_job_file.txt")
+DEFAULT_USER_ENV_FILE = str(PROJECT_ROOT / ".tritondft" / ".env.cluster")
+ADMIN_PROVIDER_KEYS = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "MP_API_KEY",
+    "CLUSTER_AGENT_MODEL",
+    "CLUSTER_AGENT_BACKEND",
+)
 DEFAULT_USER_SLURM_TEMPLATE = DEFAULT_USER_QE_SLURM_TEMPLATE
 
 
@@ -98,11 +109,47 @@ def _read_env_file(path: str) -> Dict[str, str]:
     return data
 
 
-def _write_env_file(path: str, values: Dict[str, str]) -> None:
+def _locked_admin_provider(path: str) -> Dict[str, str]:
+    """Return admin-owned provider settings when central locking is enabled."""
+    data = _read_env_file(path)
+    locked = data.get("TRITONDFT_ADMIN_LOCK_PROVIDER", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not locked:
+        return {}
+    missing = [
+        key for key in ("OPENAI_API_KEY", "MP_API_KEY", "CLUSTER_AGENT_MODEL", "CLUSTER_AGENT_BACKEND")
+        if not data.get(key, "").strip()
+    ]
+    if missing:
+        raise ValueError(
+            "TRITONDFT_ADMIN_LOCK_PROVIDER is enabled, but the administrator file "
+            f"is missing: {', '.join(missing)}"
+        )
+    return {key: data[key] for key in ADMIN_PROVIDER_KEYS if data.get(key, "").strip()}
+
+
+def _apply_locked_admin_provider(path: str) -> Dict[str, str]:
+    values = _locked_admin_provider(path)
+    if values:
+        os.environ["TRITONDFT_ADMIN_LOCK_PROVIDER"] = "true"
+    for key, value in values.items():
+        os.environ[key] = value
+    return values
+
+
+def _write_env_file(
+    path: str,
+    values: Dict[str, str],
+    *,
+    exclude_keys: tuple[str, ...] = (),
+) -> None:
     env_path = Path(path).expanduser()
     env_path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_env_file(str(env_path))
     existing.update({k: v for k, v in values.items() if v is not None})
+    for key in exclude_keys:
+        existing.pop(key, None)
 
     ordered_keys = [
         "OPENAI_API_KEY",
@@ -131,6 +178,20 @@ def _write_env_file(path: str, values: Dict[str, str]) -> None:
         if key in existing:
             lines.append(f"{key}={existing[key]}")
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    env_path.chmod(0o600)
+
+
+def _initialize_user_config(path: str, legacy_path: str = "") -> None:
+    """Create the private config directory and migrate the old local config."""
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination.parent.chmod(0o700)
+    legacy = Path(legacy_path).expanduser().resolve() if legacy_path else PROJECT_ROOT / ".env.cluster"
+    default_destination = Path(DEFAULT_USER_ENV_FILE).expanduser().resolve()
+    if destination == default_destination and not destination.exists() and legacy.is_file():
+        shutil.copy2(legacy, destination)
+        destination.chmod(0o600)
+        print(f"[cluster-agent] Migrated cluster configuration to {destination}")
 
 
 def _env_missing_cluster_setup(path: str, *, include_environment: bool = False) -> bool:
@@ -404,9 +465,9 @@ def _run_super_user_setup(env_file: str) -> None:
 
     print("TritonDFT needs a per-user remote cluster setup for this Linux account.\n")
     print("This will create/update:")
-    print("  - ~/.tritondft/.env.cluster")
-    print("  - ~/.tritondft/example_qe_slurm_job_file.txt")
-    print("  - ~/.tritondft/example_vasp_slurm_job_file.txt")
+    print(f"  - {DEFAULT_USER_ENV_FILE}")
+    print(f"  - {DEFAULT_USER_QE_SLURM_TEMPLATE}")
+    print(f"  - {DEFAULT_USER_VASP_SLURM_TEMPLATE}")
     print("  - ~/.ssh/config, if you choose to create an SSH alias\n")
 
     print("\nPlease provide the remote cluster connection details.")
@@ -432,6 +493,7 @@ def _run_super_user_setup(env_file: str) -> None:
         raise ValueError("Cluster nickname, user id, login hostname, and remote working directory are required.")
 
     ssh_target = _ensure_ssh_config_host(username=username, hostname=hostname, preferred_alias=alias)
+    provider_locked = os.environ.get("TRITONDFT_ADMIN_LOCK_PROVIDER") == "true"
     _write_env_file(
         env_file,
         {
@@ -461,6 +523,10 @@ def _run_super_user_setup(env_file: str) -> None:
             "CLUSTER_AGENT_VASP_FUNCTIONAL": os.environ.get("CLUSTER_AGENT_VASP_FUNCTIONAL", ""),
             "CLUSTER_AGENT_NO_QUERY_INFO": os.environ.get("CLUSTER_AGENT_NO_QUERY_INFO", "false"),
         },
+        exclude_keys=(
+            ("OPENAI_API_KEY", "MP_API_KEY", "CLUSTER_AGENT_MODEL", "CLUSTER_AGENT_BACKEND")
+            if provider_locked else ()
+        ),
     )
     _ensure_env_defaults(env_file)
     print(f"\nSetup complete. Cluster settings were written to {env_file}.")
@@ -499,6 +565,14 @@ class SSHClusterTransport:
         self.poll_seconds = poll_seconds
         self.keep_master = keep_master
         self.verbose = verbose
+        self.activity_dir: Optional[Path] = None
+
+    def set_activity_dir(self, run_dir: str | Path) -> None:
+        self.activity_dir = Path(run_dir).expanduser().resolve()
+
+    def _activity(self, event: str, detail: str = "", state: str = "info") -> None:
+        if self.activity_dir is not None:
+            append_activity(self.activity_dir, event, detail, state)
 
     def set_remote_root(self, remote_root: str) -> None:
         remote_root = remote_root.strip().rstrip("/")
@@ -521,11 +595,22 @@ class SSHClusterTransport:
         if check.returncode == 0:
             if self.verbose:
                 print("[cluster] persistent SSH connection is active.")
+            self._activity("SSH connection active", "Persistent connection is ready.", "success")
             return
 
         print("[cluster] opening persistent SSH connection. You may be prompted for password/OTP.")
-        _run_interactive(f"ssh -MNf {shlex.quote(self.ssh_target)}", verbose=self.verbose)
-        self.test_connection()
+        self._activity(
+            "SSH authentication required",
+            "Return to the terminal and enter the cluster password and TOTP when prompted. Credentials are never accepted by the dashboard.",
+            "waiting_terminal",
+        )
+        try:
+            _run_interactive(f"ssh -MNf {shlex.quote(self.ssh_target)}", verbose=self.verbose)
+            self.test_connection()
+        except Exception as exc:
+            self._activity("SSH connection failed", str(exc), "error")
+            raise
+        self._activity("SSH authentication completed", "Persistent connection established.", "success")
 
     def close_connection(self) -> None:
         if not self.keep_master:
@@ -594,9 +679,19 @@ class SSHClusterTransport:
         )
 
     def upload_directory(self, local_dir: Path, remote_dir: str) -> None:
+        """Upload a directory's contents into an existing or new remote directory."""
+        local_dir = Path(local_dir).expanduser().resolve()
+        if not local_dir.is_dir():
+            raise FileNotFoundError(f"Local upload directory does not exist: {local_dir}")
         remote_q = shlex.quote(remote_dir)
         _run_interactive(
             f"ssh {shlex.quote(self.ssh_target)} 'mkdir -p {remote_q}'",
+            verbose=self.verbose,
+        )
+        _run_interactive(
+            "rsync -az --progress -e ssh "
+            f"{shlex.quote(str(local_dir) + '/')} "
+            f"{shlex.quote(self.ssh_target + ':' + remote_dir + '/')}",
             verbose=self.verbose,
         )
 
@@ -612,17 +707,20 @@ class SSHClusterTransport:
             f"ssh {shlex.quote(self.ssh_target)} 'mkdir -p {remote_q}'",
             verbose=self.verbose,
         )
-        selected = [Path(path) for path in paths if Path(path).is_file()]
+        candidates = [Path(path).expanduser().resolve() for path in paths]
+        selected = [path for path in candidates if path.is_file()]
         pseudo_dir = local_dir / "pseudos"
         if pseudo_dir.is_dir():
-            selected.append(pseudo_dir)
-        for source in selected:
-            _run_interactive(
-                "rsync -az --progress -e ssh "
-                f"{shlex.quote(str(source))} "
-                f"{shlex.quote(self.ssh_target + ':' + remote_dir + '/')}",
-                verbose=self.verbose,
-            )
+            selected.append(pseudo_dir.expanduser().resolve())
+        if not selected:
+            return
+        sources = " ".join(shlex.quote(str(source)) for source in selected)
+        _run_interactive(
+            "rsync -az --progress -e ssh -- "
+            f"{sources} "
+            f"{shlex.quote(self.ssh_target + ':' + remote_dir + '/')}",
+            verbose=self.verbose,
+        )
 
     def submit(self, remote_dir: str, script_name: str) -> ClusterJob:
         remote_dir_q = shlex.quote(remote_dir)
@@ -731,6 +829,30 @@ class SSHClusterTransport:
             if result.strip() != "ok":
                 problems.append(f"Remote artifact missing/empty: {remote_file}")
         return problems
+
+    def assemble_remote_vasp_potcar(self, remote_dir: str) -> None:
+        """Build POTCAR remotely and refuse to continue unless it is non-empty."""
+        directory_q = shlex.quote(remote_dir)
+        command = f"cd {directory_q} && bash ./assemble_potcar.sh && test -s POTCAR"
+        _run_interactive(
+            f"ssh {shlex.quote(self.ssh_target)} {shlex.quote(command)}",
+            verbose=self.verbose,
+        )
+
+    def remote_file_sha256(self, remote_dir: str, name: str) -> str:
+        """Return a remote file digest for cross-step identity checks."""
+        if not re.fullmatch(r"[A-Za-z0-9_.+-]+", name):
+            raise ValueError(f"Unsafe remote file name: {name!r}")
+        remote_file = shlex.quote(f"{remote_dir}/{name}")
+        output = _run_capture(
+            f"ssh {shlex.quote(self.ssh_target)} "
+            f"{shlex.quote(f'sha256sum {remote_file}')} ",
+            verbose=False,
+        )
+        digest = output.split()[0] if output else ""
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise RuntimeError(f"Could not calculate SHA-256 for {remote_dir}/{name}")
+        return digest.lower()
 
     def remote_qe_state_ok(self, remote_dir: str, prefix: str = "tritondft_workflow") -> List[str]:
         save_q = shlex.quote(f"{remote_dir}/{prefix}.save")
@@ -1439,6 +1561,7 @@ def _approve_inputs_popup(
         if plan_only:
             structure_frame = ttk.Frame(notebook)
             defaults = structure_defaults or {}
+            structure_read_only = bool(defaults.get("read_only"))
             source_var = tk.StringVar(
                 value="materials_project" if defaults.get("materials_project_available") else "file"
             )
@@ -1457,21 +1580,22 @@ def _approve_inputs_popup(
                 text=str(defaults.get("materials_project_status") or "Materials Project status unavailable."),
                 wraplength=980, justify="left",
             ).pack(fill="x", padx=12, pady=(0, 10))
-            mp_button = ttk.Radiobutton(
-                structure_frame,
-                text=("Use the Materials Project structure shown above (default)" if defaults.get("materials_project_available")
-                      else "Use Materials Project structure (none was retrieved)"),
-                variable=source_var, value="materials_project",
-            )
-            mp_button.pack(anchor="w", padx=12, pady=4)
-            if not defaults.get("materials_project_available"):
-                mp_button.configure(state="disabled")
-            ttk.Radiobutton(
-                structure_frame, text="Use my structure file", variable=source_var, value="file"
-            ).pack(anchor="w", padx=12, pady=4)
-            path_row = ttk.Frame(structure_frame)
-            path_row.pack(fill="x", padx=30, pady=8)
-            ttk.Entry(path_row, textvariable=path_var).pack(side="left", fill="x", expand=True)
+            if not structure_read_only:
+                mp_button = ttk.Radiobutton(
+                    structure_frame,
+                    text=("Use the Materials Project structure shown above (default)" if defaults.get("materials_project_available")
+                          else "Use Materials Project structure (none was retrieved)"),
+                    variable=source_var, value="materials_project",
+                )
+                mp_button.pack(anchor="w", padx=12, pady=4)
+                if not defaults.get("materials_project_available"):
+                    mp_button.configure(state="disabled")
+                ttk.Radiobutton(
+                    structure_frame, text="Use my structure file", variable=source_var, value="file"
+                ).pack(anchor="w", padx=12, pady=4)
+                path_row = ttk.Frame(structure_frame)
+                path_row.pack(fill="x", padx=30, pady=8)
+                ttk.Entry(path_row, textvariable=path_var).pack(side="left", fill="x", expand=True)
 
             def browse_structure() -> None:
                 selected = filedialog.askopenfilename(
@@ -1485,13 +1609,14 @@ def _approve_inputs_popup(
                     source_var.set("file")
                     path_var.set(selected)
 
-            ttk.Button(path_row, text="Browse…", command=browse_structure).pack(side="left", padx=(8, 0))
-            ttk.Label(
-                structure_frame,
-                text=("Supported formats include CIF, POSCAR/CONTCAR, pymatgen JSON/YAML, CSSR, "
-                      "and Quantum ESPRESSO pw.x input files."),
-                wraplength=980,
-            ).pack(anchor="w", padx=30, pady=(0, 12))
+            if not structure_read_only:
+                ttk.Button(path_row, text="Browse…", command=browse_structure).pack(side="left", padx=(8, 0))
+                ttk.Label(
+                    structure_frame,
+                    text=("Supported formats include CIF, POSCAR/CONTCAR, pymatgen JSON/YAML, CSSR, "
+                          "and Quantum ESPRESSO pw.x input files."),
+                    wraplength=980,
+                ).pack(anchor="w", padx=30, pady=(0, 12))
             notebook.add(structure_frame, text="Structure source")
             structure_controls = {"source": source_var, "path": path_var, "frame": structure_frame}
 
@@ -1609,7 +1734,7 @@ def _approve_inputs_popup(
             if plan_only:
                 source = structure_controls["source"].get()
                 structure_path = structure_controls["path"].get().strip()
-                if source == "file":
+                if source == "file" and not structure_read_only:
                     if not structure_path or not Path(structure_path).expanduser().is_file():
                         notebook.select(structure_controls["frame"])
                         messagebox.showerror(
@@ -1710,6 +1835,11 @@ def _approve_inputs_popup(
                         print("Nodes and cores per node must both be at least 1.")
                         continue
                     mp_available = bool((structure_defaults or {}).get("materials_project_available"))
+                    if (structure_defaults or {}).get("read_only"):
+                        return {
+                            "action": "approve", "revision": "", "resources": resources,
+                            "structure": {"source": "materials_project", "path": ""},
+                        }
                     prompt = (
                         "Structure source [materials_project/file]"
                         + (" [materials_project]" if mp_available else " [file]")
@@ -1913,6 +2043,40 @@ def _launch_workflow_monitor(run_dir: str | Path) -> bool:
     return True
 
 
+_BROWSER_DASHBOARD_SESSIONS: Dict[str, BrowserDashboardSession] = {}
+
+
+def _browser_dashboard_session(run_dir: str | Path) -> BrowserDashboardSession:
+    """Return the one browser session associated with this process/run."""
+    key = str(Path(run_dir).expanduser().resolve())
+    session = _BROWSER_DASHBOARD_SESSIONS.get(key)
+    if session is None:
+        session = BrowserDashboardSession(key)
+        _BROWSER_DASHBOARD_SESSIONS[key] = session
+    return session
+
+
+def _launch_configured_dashboard(run_dir: str | Path) -> bool:
+    """Dispatch around, but never alter, the established X11 monitor."""
+    mode = dashboard_mode()
+    started = False
+    if mode in {"browser", "both"}:
+        _browser_dashboard_session(run_dir).publish_monitor()
+        started = True
+    if mode in {"x11", "both"}:
+        started = _launch_workflow_monitor(run_dir) or started
+    return started
+
+
+def _close_browser_dashboard_sessions() -> None:
+    for session in list(_BROWSER_DASHBOARD_SESSIONS.values()):
+        try:
+            session.close()
+        except Exception:
+            pass
+    _BROWSER_DASHBOARD_SESSIONS.clear()
+
+
 def _discover_workflows(work_root: str | Path) -> List[Dict[str, Any]]:
     """Find checkpointed workflows without descending into large QE save trees."""
     root = Path(work_root).expanduser().resolve()
@@ -2048,11 +2212,41 @@ class RemoteClusterDFTAgent:
     ):
         self.agent = dft_agent
         self.transport = transport
-        self.approval_callback = approval_callback or _approve_inputs_popup
+        self.dashboard_mode = dashboard_mode()
+        if approval_callback is not None:
+            self.approval_callback = approval_callback
+        elif self.dashboard_mode == "browser":
+            self.approval_callback = self._browser_approval
+        elif self.dashboard_mode == "both":
+            self.approval_callback = self._both_approval
+        else:
+            self.approval_callback = _approve_inputs_popup
         self._uses_default_approval = approval_callback is None
         self.download_callback = download_callback or _prompt_download_scope
         self.failure_callback = failure_callback or _prompt_failure_action
         self.agent.run_mode = "cluster_input"
+
+    def _browser_approval(self, plan, input_paths, workflow_validator=None, **kwargs):
+        return _browser_dashboard_session(self.agent.work_dir).request_approval(
+            plan, input_paths, workflow_validator, **kwargs
+        )
+
+    def _both_approval(self, plan, input_paths, workflow_validator=None, **kwargs):
+        # The browser observes the same draft/session while the unchanged X11
+        # approval window remains authoritative in experimental "both" mode.
+        session = _browser_dashboard_session(self.agent.work_dir)
+        session.store.publish_approval(session.token, {
+            "plan": plan,
+            "review_stage": kwargs.get("review_stage", "inputs"),
+            "workflow_steps": kwargs.get("workflow_steps", []),
+            "editable_files": [],
+            "resource_defaults": kwargs.get("resource_defaults", {}),
+            "structure_defaults": kwargs.get("structure_defaults", {}),
+            "notice": "X11 is authoritative for approval while both mode is experimental.",
+        })
+        return _approve_inputs_popup(
+            plan, input_paths, workflow_validator, **kwargs
+        )
 
     def _apply_resource_limits(self, resources: Dict[str, Any], run_dir: Path) -> None:
         nodes = int(resources.get("max_nodes", 0))
@@ -2716,7 +2910,7 @@ class RemoteClusterDFTAgent:
         # generation. Otherwise a generation error can bypass the user's only
         # opportunity to correct an over-expanded or scientifically wrong plan.
         if self._uses_default_approval:
-            plan_decision = _approve_inputs_popup(
+            plan_decision = self.approval_callback(
                 plan,
                 [],
                 workflow_validator=lambda: [
@@ -3040,13 +3234,16 @@ class RemoteClusterDFTAgent:
                     checkpoint.reused_from_run = parent_state.run_dir
             workflow_state.save()
         if self._uses_default_approval:
-            _launch_workflow_monitor(workflow_state.run_dir)
+            _launch_configured_dashboard(workflow_state.run_dir)
         # Fresh and resumed workflows deliberately share the same executor.
         # Each submission is recorded in a new immutable attempt directory.
         return self.resume(workflow_state.run_dir)
 
         # Legacy inline executor retained temporarily below for checkpoint-file
         # compatibility; it is unreachable and will be removed after migration.
+        if hasattr(self.transport, "set_activity_dir"):
+            self.transport.set_activity_dir(workflow_state.run_dir)
+        append_activity(workflow_state.run_dir, "Workflow execution starting", "Preparing cluster connection.", "working")
         self.transport.ensure_connection()
 
         total_memory = ""
@@ -3920,13 +4117,16 @@ def interactive_main() -> None:
     )
     env_parser.add_argument(
         "--env-file",
-        default=os.environ.get("CLUSTER_AGENT_ENV_FILE", ".env.cluster"),
+        default=os.environ.get("CLUSTER_AGENT_ENV_FILE", DEFAULT_USER_ENV_FILE),
         help="Local env file with cluster-agent defaults and API keys",
     )
     env_args, remaining_args = env_parser.parse_known_args()
+    if "-h" not in remaining_args and "--help" not in remaining_args:
+        _initialize_user_config(env_args.env_file)
     _load_env_file(".env")
     _load_env_file(env_args.admin_env_file, override=True)
     _load_env_file(env_args.env_file, override=True)
+    locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
 
     if "-h" not in remaining_args and "--help" not in remaining_args:
         print(WELCOME_BANNER, flush=True)
@@ -3934,9 +4134,9 @@ def interactive_main() -> None:
             _run_super_user_setup(env_args.env_file)
             _load_env_file(env_args.env_file, override=True)
 
-        if Path(env_args.env_file).expanduser().is_file():
-            _ensure_env_defaults(env_args.env_file)
-            _load_env_file(env_args.env_file, override=True)
+        _ensure_env_defaults(env_args.env_file)
+        _load_env_file(env_args.env_file, override=True)
+        locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
 
         if _env_missing_api_keys(env_args.env_file, include_environment=True):
             print(
@@ -3962,6 +4162,13 @@ def interactive_main() -> None:
     parser.add_argument("--model", default=os.environ.get("CLUSTER_AGENT_MODEL", "gpt-4o"))
     parser.add_argument("--backend", default=os.environ.get("CLUSTER_AGENT_BACKEND", "openai"))
     parser.add_argument("--work-dir", default=os.environ.get("CLUSTER_AGENT_WORK_DIR", "tmp"))
+    parser.add_argument(
+        "--dashboard",
+        choices=("x11", "xwindows", "x-windows", "browser", "https", "both"),
+        default=dashboard_mode(),
+        help=("Dashboard interface: x11/xwindows for the native window, "
+              "browser/https for the web interface, or both (default: x11)"),
+    )
     parser.add_argument(
         "--resume",
         default="",
@@ -4038,6 +4245,22 @@ def interactive_main() -> None:
     )
     parser.add_argument("--no-master", action="store_true", help="Do not open SSH ControlMaster connection")
     args = parser.parse_args(remaining_args)
+    if locked_provider:
+        # Central provider policy is authoritative even when a participant
+        # supplies --model/--backend or edits their personal env file.
+        args.model = locked_provider["CLUSTER_AGENT_MODEL"]
+        args.backend = locked_provider["CLUSTER_AGENT_BACKEND"]
+        print(
+            f"[admin] Using administrator-managed {args.backend} model {args.model}; "
+            "participant provider overrides are disabled."
+        )
+    if args.dashboard == "https" and not os.environ.get(
+        "TRITONDFT_DASHBOARD_PUBLIC_URL", ""
+    ).strip().lower().startswith("https://"):
+        parser.error(
+            "--dashboard https requires TRITONDFT_DASHBOARD_PUBLIC_URL to be an https:// URL"
+        )
+    os.environ["TRITONDFT_DASHBOARD_MODE"] = args.dashboard
 
     if not args.ssh_target:
         args.ssh_target = input("SSH target alias or user@host: ").strip()
@@ -4069,10 +4292,67 @@ def interactive_main() -> None:
             functional=args.vasp_functional,
             slurm_template_path=args.vasp_slurm_template,
         )
+        vasp_approval = None
+        vasp_plan_approval = _approve_inputs_popup
+        selected_dashboard_mode = dashboard_mode()
+        if selected_dashboard_mode == "browser":
+            def vasp_plan_approval(plan_text, input_paths, **kwargs):
+                return _browser_dashboard_session(vasp_agent.work_dir).request_approval(
+                    plan_text, input_paths, **kwargs
+                )
+
+            def vasp_approval(plan_text, input_sets):
+                from vasp_agent import _validation_errors
+                paths = [
+                    str(item.directory / name)
+                    for item in input_sets
+                    for name in ("POSCAR", "INCAR", "KPOINTS")
+                    if (item.directory / name).is_file()
+                ]
+                decision = _browser_dashboard_session(vasp_agent.work_dir).request_approval(
+                    plan_text,
+                    paths,
+                    lambda: [
+                        message
+                        for item in input_sets
+                        for message in _validation_errors(item)
+                    ],
+                    workflow_steps=[],
+                )
+                return decision.get("action") == "approve"
+        elif selected_dashboard_mode == "both":
+            def vasp_plan_approval(plan_text, input_paths, **kwargs):
+                session = _browser_dashboard_session(vasp_agent.work_dir)
+                session.store.publish_approval(session.token, {
+                    "plan": plan_text,
+                    "review_stage": "plan",
+                    "workflow_steps": kwargs.get("workflow_steps", []),
+                    "editable_files": [],
+                    "resource_defaults": kwargs.get("resource_defaults", {}),
+                    "structure_defaults": kwargs.get("structure_defaults", {}),
+                    "notice": "X11 is authoritative for plan approval while both mode is enabled.",
+                })
+                return _approve_inputs_popup(plan_text, input_paths, **kwargs)
+
+            def vasp_approval(plan_text, input_sets):
+                session = _browser_dashboard_session(vasp_agent.work_dir)
+                session.store.publish_approval(session.token, {
+                    "plan": plan_text,
+                    "review_stage": "inputs",
+                    "workflow_steps": [],
+                    "editable_files": [],
+                    "resource_defaults": {},
+                    "structure_defaults": {},
+                    "notice": "X11 is authoritative for approval while both mode is experimental.",
+                })
+                return _approve_vasp_inputs_popup(plan_text, input_sets)
         agent = RemoteClusterVASPAgent(
             vasp_agent=vasp_agent,
             transport=transport,
-            parallel_np=args.parallel_np or 1,
+            approval_callback=vasp_approval,
+            plan_approval_callback=vasp_plan_approval,
+            monitor_callback=_launch_configured_dashboard,
+            parallel_np=args.parallel_np,
             vasp_command=args.remote_vasp_command,
             slurm_template_path=args.vasp_slurm_template,
         )
@@ -4110,7 +4390,7 @@ def interactive_main() -> None:
             try:
                 if args.fresh_start_step:
                     agent.fresh_start_step(args.resume, args.fresh_start_step)
-                _launch_workflow_monitor(args.resume)
+                _launch_configured_dashboard(args.resume)
                 resumed_state = WorkflowCheckpoint.load(args.resume)
                 if any(step.status == "awaiting_user" for step in resumed_state.steps):
                     result = agent.recovery_console(
@@ -4163,7 +4443,7 @@ def interactive_main() -> None:
                     )
                     continue
                 print(f"[workflows] Opening monitor: {run_to_open}")
-                _launch_workflow_monitor(run_to_open)
+                _launch_configured_dashboard(run_to_open)
                 continue
             if normalized_query == "resume" or normalized_query.startswith("resume "):
                 if dft_code != "qe":
@@ -4197,7 +4477,7 @@ def interactive_main() -> None:
                     print(f"[resume] Step {fresh_step} scheduled as a new immutable attempt.")
                 print(f"[resume] Reusing saved plan and approved inputs: {run_to_resume}")
                 print("[resume] No planning or input-generation API calls will be made.")
-                _launch_workflow_monitor(run_to_resume)
+                _launch_configured_dashboard(run_to_resume)
                 try:
                     result = agent.resume(run_to_resume)
                     print(json.dumps(result, indent=2))
@@ -4265,6 +4545,7 @@ def interactive_main() -> None:
         close = input("Close persistent SSH connection? [y/N] ").strip().lower()
         if close == "y":
             transport.close_connection()
+        _close_browser_dashboard_sessions()
 
 
 if __name__ == "__main__":

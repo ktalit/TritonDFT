@@ -23,6 +23,7 @@ from cluster_agent import (
     _approval_result,
     _env_missing_cluster_setup,
     _env_missing_api_keys,
+    _apply_locked_admin_provider,
     _extract_relaxed_structure,
     _ensure_env_defaults,
     _input_validation_errors,
@@ -236,6 +237,45 @@ class PlaceholderTests(unittest.TestCase):
         self.assertEqual(result["summary"]["energy_above_hull"], 0.0)
         self.assertEqual([kind for kind, _ in calls], ["summary", "materials"])
 
+    def test_material_lookup_uses_attributes_for_document_models(self):
+        from pymatgen.core import Lattice, Structure
+
+        structure = Structure(Lattice.cubic(5.4), ["Si", "Si"], [[0, 0, 0], [.25, .25, .25]])
+
+        class Document:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("deprecated document dict interface was used")
+
+            def __getitem__(self, _key):
+                raise AssertionError("deprecated document dict interface was used")
+
+        class SummaryEndpoint:
+            def search(self, **_kwargs):
+                return [Document(material_id="mp-1", structure=structure, energy_above_hull=0.0)]
+
+        class MaterialsEndpoint:
+            def __init__(self):
+                self.summary = SummaryEndpoint()
+
+            def search(self, **_kwargs):
+                return [Document(material_id="mp-1", initial_structures=[structure])]
+
+        class FakeMPRester:
+            def __init__(self, **_kwargs):
+                self.materials = MaterialsEndpoint()
+
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        with patch("mp_api.client.MPRester", FakeMPRester):
+            result = fetch_material_info_from_api_snippet('mpr.materials.search(formula="Si")')
+
+        self.assertEqual(result["material_ids"], ["mp-1"])
+        self.assertEqual(result["summary"]["energy_above_hull"], 0.0)
+
     def test_material_lookup_filters_symmetry_before_hull_ranking(self):
         from pymatgen.core import Lattice, Structure
         from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
@@ -265,6 +305,29 @@ class PlaceholderTests(unittest.TestCase):
             }, clear=False):
                 self.assertFalse(_env_missing_api_keys(missing, include_environment=True))
                 self.assertTrue(_env_missing_api_keys(missing, include_environment=False))
+
+    def test_locked_admin_provider_overrides_user_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            admin = Path(tmp) / ".env.cluster_admin"
+            admin.write_text(
+                "TRITONDFT_ADMIN_LOCK_PROVIDER=true\n"
+                "OPENAI_API_KEY=admin-key\n"
+                "MP_API_KEY=admin-mp-key\n"
+                "CLUSTER_AGENT_MODEL=admin-model\n"
+                "CLUSTER_AGENT_BACKEND=openai\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {
+                "OPENAI_API_KEY": "user-key",
+                "CLUSTER_AGENT_MODEL": "user-model",
+                "CLUSTER_AGENT_BACKEND": "claude",
+            }, clear=False):
+                values = _apply_locked_admin_provider(str(admin))
+                self.assertEqual(values["CLUSTER_AGENT_MODEL"], "admin-model")
+                self.assertEqual(os.environ["OPENAI_API_KEY"], "admin-key")
+                self.assertEqual(os.environ["MP_API_KEY"], "admin-mp-key")
+                self.assertEqual(os.environ["CLUSTER_AGENT_MODEL"], "admin-model")
+                self.assertEqual(os.environ["CLUSTER_AGENT_BACKEND"], "openai")
 
     def test_user_supplied_structure_replaces_database_material_info(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -502,6 +565,9 @@ class PlaceholderTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 os.environ["HOME"] = tmp
                 env_path = Path(tmp) / ".env.cluster"
+                config_dir = Path(tmp) / ".tritondft"
+                qe_template = config_dir / "example_qe_slurm_job_file.txt"
+                vasp_template = config_dir / "example_vasp_slurm_job_file.txt"
                 env_path.write_text(
                     "OPENAI_API_KEY=x\n"
                     "MP_API_KEY=y\n"
@@ -509,16 +575,19 @@ class PlaceholderTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                _ensure_env_defaults(str(env_path))
+                with patch("cluster_agent.DEFAULT_USER_QE_SLURM_TEMPLATE", str(qe_template)), \
+                     patch("cluster_agent.DEFAULT_USER_VASP_SLURM_TEMPLATE", str(vasp_template)):
+                    _ensure_env_defaults(str(env_path))
 
                 env_text = env_path.read_text(encoding="utf-8")
                 self.assertIn(
-                    "TRITONDFT_SLURM_TEMPLATE=~/.tritondft/example_qe_slurm_job_file.txt",
+                    f"TRITONDFT_SLURM_TEMPLATE={qe_template}",
                     env_text,
                 )
-                user_template = Path(tmp) / ".tritondft" / "example_qe_slurm_job_file.txt"
-                self.assertTrue(user_template.exists())
-                self.assertIn("#SBATCH", user_template.read_text(encoding="utf-8"))
+                self.assertTrue(qe_template.exists())
+                self.assertIn("#SBATCH", qe_template.read_text(encoding="utf-8"))
+                self.assertTrue(vasp_template.exists())
+                self.assertIn("exe=vasp_std", vasp_template.read_text(encoding="utf-8"))
         finally:
             if old_home is not None:
                 os.environ["HOME"] = old_home
@@ -1155,6 +1224,26 @@ class ApprovalWorkflowTests(unittest.TestCase):
         self.assertIn("tritondft_workflow.save", command)
         self.assertIn("tritondft_workflow.xml", command)
         self.assertNotIn("cp -a /remote/run/branches/core/. ", command)
+
+    def test_step_files_are_uploaded_with_one_batched_rsync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp)
+            incar = local / "INCAR"
+            poscar = local / "POSCAR"
+            incar.write_text("ENCUT = 500\n", encoding="utf-8")
+            poscar.write_text("Si\n", encoding="utf-8")
+            transport = SSHClusterTransport("expanse", "/remote", verbose=False)
+            with patch("cluster_agent._run_interactive") as runner:
+                transport.upload_step_files(
+                    local, "/remote/run/step", [str(incar), str(poscar)]
+                )
+            self.assertEqual(runner.call_count, 2)
+            mkdir_command = runner.call_args_list[0].args[0]
+            rsync_command = runner.call_args_list[1].args[0]
+            self.assertIn("mkdir -p", mkdir_command)
+            self.assertEqual(rsync_command.count("rsync "), 1)
+            self.assertIn(str(incar), rsync_command)
+            self.assertIn(str(poscar), rsync_command)
 
     def test_dynmat_declares_gamma_dynamical_matrix_as_parent_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

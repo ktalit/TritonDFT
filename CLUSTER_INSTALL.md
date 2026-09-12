@@ -224,8 +224,8 @@ This must print the command-line help without an import traceback.
 ## 7. Create the private per-user configuration directory
 
 ```bash
-mkdir -p ~/.tritondft
-chmod 700 ~/.tritondft
+mkdir -p /path/to/TritonDFT/.tritondft
+chmod 700 /path/to/TritonDFT/.tritondft
 ```
 
 Why: this directory contains API keys and user-specific cluster configuration.
@@ -234,9 +234,10 @@ Permission `700` allows only its owner to access it.
 The directory must ultimately contain at least:
 
 ```text
-~/.tritondft/
+/path/to/TritonDFT/.tritondft/
   .env.cluster
   example_qe_slurm_job_file.txt
+  example_vasp_slurm_job_file.txt
 ```
 
 VASP users will also need `example_vasp_slurm_job_file.txt` and access to their
@@ -246,9 +247,9 @@ The first interactive launch can create starter files automatically. They can
 also be initialized from the repository examples:
 
 ```bash
-cp -n .env.cluster.example ~/.tritondft/.env.cluster
-cp -n example_slurm_job_file.txt ~/.tritondft/example_qe_slurm_job_file.txt
-chmod 600 ~/.tritondft/.env.cluster
+cp -n .env.cluster.example .tritondft/.env.cluster
+cp -n example_slurm_job_file.txt .tritondft/example_qe_slurm_job_file.txt
+chmod 600 .tritondft/.env.cluster
 ```
 
 `cp -n` preserves an existing configuration instead of overwriting it.
@@ -256,7 +257,7 @@ chmod 600 ~/.tritondft/.env.cluster
 ### Checkpoint 7
 
 ```bash
-ls -la ~/.tritondft
+ls -la .tritondft
 ```
 
 Confirm that `.env.cluster` is visible with `ls -la` and is readable only by
@@ -284,10 +285,16 @@ GTK 3 and OpenGL libraries supplied by the cluster operating system.
 
 An administrator can provide shared defaults at
 `/opt/tritondft/config/.env.cluster_admin`. Copy `.env.cluster_admin.example`
-as a starting point. TritonDFT loads the central file first and then loads the
-user's `--env-file`, so `~/.tritondft/.env.cluster` remains an optional personal
-override. Set a different central path with `TRITONDFT_ADMIN_ENV` or
-`--admin-env-file`.
+as a starting point. Set `TRITONDFT_ADMIN_LOCK_PROVIDER=true` to make
+`OPENAI_API_KEY`, `OPENAI_BASE_URL` (when set), `MP_API_KEY`, `CLUSTER_AGENT_MODEL`, and
+`CLUSTER_AGENT_BACKEND` administrator-owned. These values are reapplied after
+the user's `--env-file`, and command-line model/backend overrides are ignored.
+Other cluster settings remain user-configurable. Set a different central path
+with `TRITONDFT_ADMIN_ENV` or `--admin-env-file`.
+
+Keep SSH targets, remote working directories, Slurm-template paths, scheduler
+resources, and VASP installation settings in each user's `.tritondft/.env.cluster`.
+They do not belong in the locked administrator provider file.
 
 Do not commit the populated administrator file. For a workshop, use a temporary
 restricted API key with provider spending/rate limits and revoke or rotate it
@@ -295,7 +302,7 @@ afterward. A process running as a participant may receive the key in its
 environment, so this convenience setup is not a substitute for a protected API
 proxy when the credential must remain secret from users.
 
-Edit `~/.tritondft/.env.cluster`. The following is an example for a user whose
+Edit `.tritondft/.env.cluster`. The following is an example for a user whose
 TritonDFT client runs locally and submits to LRC:
 
 ```dotenv
@@ -309,9 +316,9 @@ CLUSTER_AGENT_MODEL=gpt-5.5
 CLUSTER_AGENT_BACKEND=openai
 CLUSTER_AGENT_WORK_DIR=tmp
 CLUSTER_AGENT_POLL_SECONDS=30
-TRITONDFT_SLURM_TEMPLATE=~/.tritondft/example_qe_slurm_job_file.txt
-TRITONDFT_QE_SLURM_TEMPLATE=~/.tritondft/example_qe_slurm_job_file.txt
-TRITONDFT_VASP_SLURM_TEMPLATE=~/.tritondft/example_vasp_slurm_job_file.txt
+TRITONDFT_SLURM_TEMPLATE=/path/to/TritonDFT/.tritondft/example_qe_slurm_job_file.txt
+TRITONDFT_QE_SLURM_TEMPLATE=/path/to/TritonDFT/.tritondft/example_qe_slurm_job_file.txt
+TRITONDFT_VASP_SLURM_TEMPLATE=/path/to/TritonDFT/.tritondft/example_vasp_slurm_job_file.txt
 CLUSTER_AGENT_REMOTE_QE_BIN_DIR=
 CLUSTER_AGENT_NO_QUERY_INFO=false
 ```
@@ -326,7 +333,7 @@ Why each setting exists:
 - `CLUSTER_AGENT_WORK_DIR` stores local generated inputs and downloaded output.
 - `CLUSTER_AGENT_POLL_SECONDS` controls how often Slurm status is checked.
 - The template variables identify the per-user Slurm templates. A path under
-  `~/.tritondft` is recommended; `/opt/...` is appropriate only when an
+  the project-local `.tritondft` is recommended; `/opt/...` is appropriate only when an
   administrator maintains a verified shared, read-only template there.
 - `CLUSTER_AGENT_REMOTE_QE_BIN_DIR` stays empty when the Slurm module commands
   put `pw.x` on `PATH`; otherwise set the remote QE `bin` directory.
@@ -338,7 +345,7 @@ Why each setting exists:
 ### Checkpoint 8
 
 ```bash
-grep -E '^(CLUSTER_AGENT_SSH_TARGET|CLUSTER_AGENT_REMOTE_ROOT|CLUSTER_AGENT_MODEL|TRITONDFT_QE_SLURM_TEMPLATE)=' ~/.tritondft/.env.cluster
+grep -E '^(CLUSTER_AGENT_SSH_TARGET|CLUSTER_AGENT_REMOTE_ROOT|CLUSTER_AGENT_MODEL|TRITONDFT_QE_SLURM_TEMPLATE)=' .tritondft/.env.cluster
 ```
 
 Inspect the output for placeholders. Do not print the API-key line.
@@ -399,7 +406,7 @@ Do not proceed until SSH works and the success message appears.
 
 ## 10. Configure and validate the Slurm template
 
-Edit `~/.tritondft/example_qe_slurm_job_file.txt`. Replace the sample account,
+Edit `.tritondft/example_qe_slurm_job_file.txt`. Replace the sample account,
 partition, and module commands with values that are valid on the target
 compute cluster.
 
@@ -445,14 +452,14 @@ Test the full command first:
 ```bash
 cd /home/YOUR_USER/TritonDFT
 source .venv/bin/activate
-./tritondft-cluster --env-file ~/.tritondft/.env.cluster
+./tritondft-cluster --env-file .tritondft/.env.cluster
 ```
 
 After it works, add an alias to `~/.bashrc` (or the startup file used by the
 login shell):
 
 ```bash
-alias tritondft='cd /home/YOUR_USER/TritonDFT && source .venv/bin/activate && ./tritondft-cluster --env-file ~/.tritondft/.env.cluster'
+alias tritondft='cd /home/YOUR_USER/TritonDFT && source .venv/bin/activate && ./tritondft-cluster --env-file .tritondft/.env.cluster'
 ```
 
 Reload the file:

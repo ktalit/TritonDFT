@@ -181,10 +181,25 @@ class WorkflowCheckpoint:
         return cls(**data)
 
 
+def _dependency_tool_name(step: Dict[str, Any]) -> str:
+    """Map code-specific task labels onto shared workflow dependency roles."""
+    tool = str(step.get("tool") or step.get("task") or "").strip().lower()
+    return {
+        "relax": "pw_relax",
+        "vc-relax": "pw_vc_relax",
+        "vc_relax": "pw_vc_relax",
+        "scf": "pw_scf",
+        "bands": "pw_bands",
+        "band": "pw_bands",
+        "nscf": "pw_nscf",
+        "dos": "dos_post",
+    }.get(tool, tool)
+
+
 def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
     """Infer artifact dependencies from the normalized subproblem sequence."""
     dependencies: List[List[int]] = []
-    scf_ids = [int(step["id"]) for step in steps if str(step.get("tool") or "") == "pw_scf"]
+    scf_ids = [int(step["id"]) for step in steps if _dependency_tool_name(step) == "pw_scf"]
     last_relax: Optional[int] = None
     last_scf: Optional[int] = None
     last_bands: Optional[int] = None
@@ -194,7 +209,8 @@ def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
     last_q2r: Optional[int] = None
     for step in steps:
         step_id = int(step["id"])
-        tool = str(step.get("tool") or "")
+        raw_tool = str(step.get("tool") or step.get("task") or "").strip().lower()
+        tool = _dependency_tool_name(step)
         problem = str(step.get("problem") or "").lower()
         parents: List[int] = []
         if tool in {"pw_relax", "pw_vc_relax"}:
@@ -219,6 +235,8 @@ def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
         elif tool in {"dos_post", "projwfc_post"}:
             if last_nscf is not None:
                 parents = [last_nscf]
+            elif raw_tool == "dos" and last_scf is not None:
+                parents = [last_scf]
         elif tool == "pw_phonon_gamma":
             scf_parent = last_scf if last_scf is not None else (scf_ids[0] if scf_ids else None)
             if scf_parent is not None:
@@ -244,7 +262,7 @@ def infer_dependencies(steps: Sequence[Dict[str, Any]]) -> List[List[int]]:
 def infer_branches(steps: Sequence[Dict[str, Any]]) -> List[str]:
     branches: List[str] = []
     for step in steps:
-        tool = str(step.get("tool") or "")
+        tool = _dependency_tool_name(step)
         problem = str(step.get("problem") or "").lower()
         is_soc_refinement = bool(
             ("soc" in problem or "spin-orbit" in problem or "spin orbit" in problem)

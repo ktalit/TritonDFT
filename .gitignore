@@ -10,9 +10,11 @@ install-checkpoints/
 .env
 .env.cluster
 .env.cluster_admin
+.tritondft/
 tmp
 local/VESTA/
 downloads/VESTA-*
+outputs/
 
 # Secret-bearing local files — NEVER commit these.
 env_setup.sh

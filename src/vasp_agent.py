@@ -3,6 +3,7 @@ import json
 import math
 import re
 import shlex
+import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,20 @@ from execute_code.slurm_template import render_slurm_script
 
 
 VASP_FILE_NAMES = ("POSCAR", "INCAR", "KPOINTS")
+VASP_RELAXED_POSCAR_PLACEHOLDER = """TRITONDFT_RELAXED_POSCAR_PLACEHOLDER
+This file is intentionally not a crystal structure.
+After vc-relax completes, TritonDFT replaces it with the verified CONTCAR.
+Do not submit this placeholder to VASP.
+"""
+
+
+def _is_relaxed_poscar_placeholder(path: Path) -> bool:
+    try:
+        return path.read_text(encoding="utf-8").startswith(
+            "TRITONDFT_RELAXED_POSCAR_PLACEHOLDER"
+        )
+    except OSError:
+        return False
 
 
 @dataclass
@@ -42,6 +57,19 @@ def _sanitize_name(name: str, max_len: int = 40) -> str:
     name = re.sub(r"[^\w\-]", "_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     return name[:max_len] if name else ""
+
+
+def _step_directory_name(task: str, occurrence: int = 1, *, max_len: int = 40) -> str:
+    base = _sanitize_name((task or "vasp").strip(), max_len=max_len)
+    if not base:
+        base = "vasp"
+    if occurrence <= 1:
+        return base
+    suffix = f"_{occurrence}"
+    candidate = f"{base}{suffix}"
+    if len(candidate) > max_len:
+        candidate = f"{base[: max_len - len(suffix)]}{suffix}"
+    return candidate
 
 
 def _extract_query_metadata(query: str) -> Dict[str, str]:
@@ -346,6 +374,218 @@ def _set_or_add_incar_tag(incar_text: str, tag: str, value: str) -> str:
     return incar_text.rstrip() + f"\n{tag} = {value}\n"
 
 
+def _vasp_task_kind(task: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", (task or "").lower()).strip("-")
+    if normalized in {"vc-relax", "cell-relax", "variable-cell-relax", "optimization"}:
+        return "vc-relax"
+    if normalized in {"relax", "ionic-relax", "geometry-optimization"}:
+        return "relax"
+    if normalized in {"bands", "band", "band-structure", "nscf"}:
+        return "bands"
+    if normalized in {"scf", "static", "single-point"}:
+        return "scf"
+    return normalized
+
+
+def _apply_default_vasp_relaxation(
+    query: str, steps: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Start new VASP workflows with relaxation unless explicitly declined."""
+    text = (query or "").lower()
+    explicit_no_relax = re.search(
+        r"\b(?:do\s+not|don't|dont|no|without|skip)\s+"
+        r"(?:a\s+|the\s+)?(?:vc[-\s]?relax(?:ation)?|relax(?:ation)?|"
+        r"geometry\s+optimi[sz]ation)\b|"
+        r"\b(?:fixed|unrelaxed)\s+(?:input\s+|supplied\s+|experimental\s+)?geometry\b",
+        text,
+    )
+    if explicit_no_relax:
+        return steps
+    if any(_vasp_task_kind(str(step.get("task") or "")) in {"vc-relax", "relax"} for step in steps):
+        return steps
+    constrained = bool(
+        re.search(
+            r"\b(?:constrained|fixed[-\s]?cell|keep\s+(?:the\s+)?cell\s+fixed)\b",
+            text,
+        )
+    )
+    relaxation = {
+        "title": "Constrained ionic relaxation" if constrained else "Variable-cell relaxation",
+        "task": "relax" if constrained else "vc-relax",
+        "why": (
+            "Relax ionic positions while keeping the supplied cell fixed, as requested."
+            if constrained
+            else "Optimize ionic positions, cell shape, and cell volume before downstream calculations."
+        ),
+    }
+    return [relaxation, *steps]
+
+
+def _incar_tag_value(text: str, tag: str) -> str:
+    match = re.search(rf"(?mi)^\s*{re.escape(tag)}\s*=\s*([^!#;\n]+)", text)
+    return match.group(1).strip() if match else ""
+
+
+def _remove_incar_tags(text: str, tags: set[str]) -> str:
+    pattern = re.compile(
+        rf"(?mi)^\s*(?:{'|'.join(re.escape(tag) for tag in sorted(tags))})\s*=.*(?:\n|$)"
+    )
+    return pattern.sub("", text).rstrip() + "\n"
+
+
+def _incar_assignments(text: str) -> Dict[str, str]:
+    return {
+        match.group(1).upper(): match.group(2).strip()
+        for match in re.finditer(r"(?mi)^\s*([A-Z][A-Z0-9_]*)\s*=\s*([^!#;\n]+)", text)
+    }
+
+
+def _derive_downstream_incar(base_text: str, generated_text: str, task: str) -> str:
+    """Derive a downstream INCAR from relaxation settings, not from scratch."""
+    kind = _vasp_task_kind(task)
+    text = _remove_incar_tags(
+        base_text, {"IBRION", "ISIF", "NSW", "POTIM", "EDIFFG", "ICHARG"}
+    )
+    allowed = {
+        "scf": {"ALGO", "EDIFF", "NELM", "ISMEAR", "SIGMA", "LCHARG", "LWAVE"},
+        "bands": {"NBANDS", "LORBIT", "LMAXMIX", "ISMEAR", "SIGMA", "EFERMI"},
+        "dos": {"NEDOS", "EMIN", "EMAX", "LORBIT", "LMAXMIX", "ISMEAR", "SIGMA"},
+        "nscf": {"NBANDS", "LORBIT", "LMAXMIX", "ISMEAR", "SIGMA"},
+    }.get(kind, set())
+    assignments = _incar_assignments(generated_text)
+    for tag in sorted(allowed):
+        if tag in assignments:
+            text = _set_or_add_incar_tag(text, tag, assignments[tag])
+    return text.rstrip() + "\n"
+
+
+def _preferred_vasp_poscar(query: str, material_info: Dict[str, Any]) -> str:
+    """Serialize the MP primitive cell unless a conventional cell is requested."""
+    user_candidates = material_info.get("user_structure") or []
+    if user_candidates:
+        structure = user_candidates[0] if isinstance(user_candidates, list) else user_candidates
+        try:
+            if isinstance(structure, dict):
+                from pymatgen.core import Structure
+                structure = Structure.from_dict(structure)
+            return str(structure.to(fmt="poscar")).rstrip() + "\n"
+        except Exception:
+            return ""
+    conventional_requested = bool(
+        re.search(r"\b(?:conventional|standard\s+conventional)\s+cell\b", query or "", re.I)
+    )
+    key = "conventional_structure" if conventional_requested else "primitive_structure"
+    candidates = material_info.get(key) or []
+    if not candidates:
+        return ""
+    structure = candidates[0] if isinstance(candidates, list) else candidates
+    try:
+        if isinstance(structure, dict):
+            from pymatgen.core import Structure
+            structure = Structure.from_dict(structure)
+        if hasattr(structure, "to"):
+            return str(structure.to(fmt="poscar")).rstrip() + "\n"
+    except Exception:
+        return ""
+    return ""
+
+
+def _vasp_material_info_from_user_structure(path: str, run_dir: Path) -> Dict[str, Any]:
+    """Load a user-selected structure for the shared QE/VASP plan-review UI."""
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f"User structure file does not exist: {source}")
+    try:
+        from pymatgen.core import Structure
+        try:
+            structure = Structure.from_file(str(source))
+        except Exception as general_error:
+            if source.suffix.lower() not in {".in", ".pwi", ".pw"}:
+                raise general_error
+            from tool.structural_analysis import _load_structure
+            structure = _load_structure(source)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not read user structure {source}. Use CIF, POSCAR/CONTCAR, "
+            f"pymatgen JSON/YAML, or CSSR. Parser error: {exc}"
+        ) from exc
+    if len(structure) < 1 or structure.lattice.volume <= 0:
+        raise ValueError(f"User structure is empty or has an invalid cell: {source}")
+    stored = run_dir / "structure_user_supplied.cif"
+    stored.write_text(structure.to(fmt="cif"), encoding="utf-8")
+    provenance = {
+        "source": "user_file",
+        "original_path": str(source),
+        "stored_cif": str(stored),
+        "formula": structure.composition.reduced_formula,
+        "sites": len(structure),
+    }
+    (run_dir / "structure_source.json").write_text(
+        json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+    )
+    return {
+        "user_structure": [structure],
+        "initial_structures": [structure.to(fmt="cif")],
+        "primitive_structure": [],
+        "conventional_structure": [],
+        "material_ids": [],
+        "summary": provenance,
+    }
+
+
+def _vasp_template_resources(path: str) -> tuple[int, int]:
+    try:
+        text = Path(path).expanduser().read_text(encoding="utf-8") if path else ""
+    except OSError:
+        text = ""
+    nodes_match = re.search(r"(?mi)^\s*#SBATCH\s+--nodes(?:=|\s+)(\d+)", text)
+    cores_match = re.search(
+        r"(?mi)^\s*#SBATCH\s+--(?:n?tasks-per-node)(?:=|\s+)(\d+)", text
+    )
+    return (
+        int(nodes_match.group(1)) if nodes_match else 1,
+        int(cores_match.group(1)) if cores_match else 1,
+    )
+
+
+def _enforce_vasp_workflow_incar(
+    path: Path, task: str, *, needs_chgcar: bool = False
+) -> None:
+    """Apply non-negotiable workflow tags after model generation."""
+    text = path.read_text(encoding="utf-8")
+    kind = _vasp_task_kind(task)
+    if kind == "vc-relax":
+        for tag, value in (("IBRION", "2"), ("ISIF", "3")):
+            text = _set_or_add_incar_tag(text, tag, value)
+        try:
+            nsw = int(float(_incar_tag_value(text, "NSW") or "0"))
+        except ValueError:
+            nsw = 0
+        if nsw <= 0:
+            text = _set_or_add_incar_tag(text, "NSW", "100")
+    elif kind == "relax":
+        for tag, value in (("IBRION", "2"), ("ISIF", "2")):
+            text = _set_or_add_incar_tag(text, tag, value)
+        try:
+            nsw = int(float(_incar_tag_value(text, "NSW") or "0"))
+        except ValueError:
+            nsw = 0
+        if nsw <= 0:
+            text = _set_or_add_incar_tag(text, "NSW", "100")
+    elif kind == "scf":
+        text = _set_or_add_incar_tag(text, "IBRION", "-1")
+        text = _set_or_add_incar_tag(text, "NSW", "0")
+        if needs_chgcar:
+            text = _set_or_add_incar_tag(text, "LCHARG", ".TRUE.")
+    elif kind == "bands":
+        for tag, value in (
+            ("IBRION", "-1"), ("NSW", "0"), ("ICHARG", "11"),
+            ("LCHARG", ".FALSE."), ("LWAVE", ".FALSE."),
+        ):
+            text = _set_or_add_incar_tag(text, tag, value)
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
 def _assemble_potcar(
     *,
     poscar_path: Path,
@@ -353,13 +593,14 @@ def _assemble_potcar(
     destination: Path,
     potcar_root: str,
     functional: str,
+    species: Optional[List[str]] = None,
 ) -> List[str]:
     root = Path(potcar_root).expanduser()
     if not root.exists():
         raise FileNotFoundError(
             f"VASP POTCAR root does not exist: {root}. Set CLUSTER_AGENT_VASP_POTCAR_ROOT."
         )
-    species = _species_from_poscar(poscar_path.read_text(encoding="utf-8"))
+    species = species or _species_from_poscar(poscar_path.read_text(encoding="utf-8"))
     if not species:
         raise ValueError(f"Could not read species order from {poscar_path}.")
 
@@ -460,7 +701,11 @@ def _validation_errors(input_set: VASPInputSet) -> List[str]:
         if not path.exists() or path.stat().st_size == 0:
             errors.append(f"{name} is missing or empty")
     poscar = input_set.directory / "POSCAR"
-    if poscar.exists() and not _species_from_poscar(poscar.read_text(encoding="utf-8")):
+    if (
+        poscar.exists()
+        and not _is_relaxed_poscar_placeholder(poscar)
+        and not _species_from_poscar(poscar.read_text(encoding="utf-8"))
+    ):
         errors.append("POSCAR does not contain a readable species/count block")
     incar = input_set.directory / "INCAR"
     if incar.exists():
@@ -698,6 +943,7 @@ class VASPAgent:
             steps = [{"title": "Static VASP calculation", "task": "static", "why": "Default single-step VASP calculation."}]
         settings = data.get("settings", {})
         valid_steps = [step for step in steps if isinstance(step, dict)]
+        valid_steps = _apply_default_vasp_relaxation(query, valid_steps)
         for step in valid_steps:
             step.setdefault("_workflow_settings", settings if isinstance(settings, dict) else {})
         return valid_steps
@@ -730,7 +976,7 @@ class VASPAgent:
             )
         return VASPRunSettings(potcar_functional=functional, vasp_command=command, reason=reason)
 
-    def generate_inputs(
+    def prepare_workflow(
         self,
         query: str,
         *,
@@ -739,6 +985,7 @@ class VASPAgent:
         task_type: str = "",
         material_name: str = "",
     ) -> Dict[str, Any]:
+        """Plan a VASP workflow and collect structure data before input generation."""
         self._prepare_run_directory(
             query,
             run_id=run_id,
@@ -762,8 +1009,54 @@ class VASPAgent:
         (self.work_dir / "workflow_plan.txt").write_text(plan_text, encoding="utf-8")
         (self.work_dir / "workflow_plan.json").write_text(json.dumps(steps, indent=2) + "\n", encoding="utf-8")
 
+        summary = material_info.get("summary") or {}
+        material_id = (material_info.get("material_ids") or [""])[0]
+        structure_status = (
+            f"Materials Project {material_id}: {summary.get('formula', '?')}, "
+            f"{summary.get('space_group', '?')}, {summary.get('n_sites_primitive', '?')} sites (primitive)."
+            if material_id else "No Materials Project structure was retrieved."
+        )
+        return {
+            "query": query,
+            "material_info": material_info,
+            "steps": steps,
+            "run_settings": run_settings,
+            "plan_text": plan_text,
+            "materials_project_available": bool(material_info.get("primitive_structure")),
+            "materials_project_status": structure_status,
+        }
+
+    def generate_inputs(
+        self,
+        query: str,
+        *,
+        run_id: int = 0,
+        category: str = "unknown",
+        task_type: str = "",
+        material_name: str = "",
+        prepared: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context = prepared or self.prepare_workflow(
+            query,
+            run_id=run_id,
+            category=category,
+            task_type=task_type,
+            material_name=material_name,
+        )
+        material_info = context["material_info"]
+        preferred_poscar = _preferred_vasp_poscar(query, material_info)
+        steps = context["steps"]
+        run_settings = context["run_settings"]
+        self.functional = run_settings.potcar_functional
+        self.vasp_command = run_settings.vasp_command
+        plan_text = context["plan_text"]
+
         previous_context = ""
         input_sets: List[VASPInputSet] = []
+        task_occurrences: Dict[str, int] = {}
+        relaxation_species: Optional[List[str]] = None
+        relaxation_seen = False
+        relaxation_incar = ""
         for index, step in enumerate(steps, start=1):
             print(f"[vasp-agent] generating input set {index}/{len(steps)}: {step.get('title') or step.get('task')}")
             prompt = _vasp_input_prompt(
@@ -786,7 +1079,11 @@ class VASPAgent:
                 purpose=f"vasp_input_{index}",
             )
             data = _parse_json_object(generated)
-            step_dir = self.work_dir / f"step_{index:02d}_{_sanitize_name(step.get('task', 'vasp'), 24)}"
+            task_name = str(step.get("task") or "vasp").strip()
+            task_kind = _vasp_task_kind(task_name)
+            occurrence = task_occurrences.get(task_name, 0) + 1
+            task_occurrences[task_name] = occurrence
+            step_dir = self.work_dir / _step_directory_name(task_name, occurrence, max_len=40)
             step_dir.mkdir(parents=True, exist_ok=True)
             files: List[str] = []
             for name in VASP_FILE_NAMES:
@@ -796,7 +1093,48 @@ class VASPAgent:
                 path = step_dir / name
                 path.write_text(content.rstrip() + "\n", encoding="utf-8")
                 files.append(str(path))
-            species = _species_from_poscar((step_dir / "POSCAR").read_text(encoding="utf-8"))
+            if index == 1 and preferred_poscar:
+                (step_dir / "POSCAR").write_text(preferred_poscar, encoding="utf-8")
+            generated_species = _species_from_poscar(
+                (step_dir / "POSCAR").read_text(encoding="utf-8")
+            )
+            uses_relaxed_poscar = relaxation_seen and task_kind not in {"relax", "vc-relax"}
+            if uses_relaxed_poscar:
+                if not relaxation_species:
+                    raise ValueError(
+                        "Cannot create a downstream POSCAR placeholder without relaxation species."
+                    )
+                (step_dir / "POSCAR").write_text(
+                    VASP_RELAXED_POSCAR_PLACEHOLDER, encoding="utf-8"
+                )
+                species = list(relaxation_species)
+            else:
+                species = generated_species
+            if task_kind in {"relax", "vc-relax"}:
+                if not species:
+                    raise ValueError(
+                        f"Relaxation POSCAR does not contain readable species for step {index}."
+                    )
+                relaxation_species = list(species)
+                relaxation_seen = True
+            if uses_relaxed_poscar:
+                if not relaxation_incar:
+                    raise ValueError(
+                        "Cannot derive downstream INCAR without the relaxation INCAR."
+                    )
+                generated_incar = (step_dir / "INCAR").read_text(encoding="utf-8")
+                (step_dir / "INCAR").write_text(
+                    _derive_downstream_incar(relaxation_incar, generated_incar, task_name),
+                    encoding="utf-8",
+                )
+            needs_chgcar = any(
+                _vasp_task_kind(str(future.get("task") or "")) == "bands"
+                for future in steps[index:]
+                if isinstance(future, dict)
+            )
+            _enforce_vasp_workflow_incar(
+                step_dir / "INCAR", task_name, needs_chgcar=needs_chgcar
+            )
             potcar_root_path = Path(self.potcar_root).expanduser()
             if potcar_root_path.exists():
                 potcar_mode = "local"
@@ -806,6 +1144,7 @@ class VASPAgent:
                     destination=step_dir / "POTCAR",
                     potcar_root=self.potcar_root,
                     functional=self.functional,
+                    species=species,
                 )
                 (step_dir / "POTCAR.sources.json").write_text(
                     json.dumps(
@@ -843,6 +1182,8 @@ class VASPAgent:
                     encoding="utf-8",
                 )
                 files.append(assemble_path)
+            if task_kind in {"relax", "vc-relax"}:
+                relaxation_incar = (step_dir / "INCAR").read_text(encoding="utf-8")
             input_set = VASPInputSet(
                 step_index=index,
                 title=str(step.get("title") or f"VASP step {index}"),
@@ -879,6 +1220,16 @@ class VASPAgent:
                     "files": item.files,
                     "species": item.species,
                     "potcar_mode": item.potcar_mode,
+                    "poscar_mode": (
+                        "relaxed_contcar_placeholder"
+                        if _is_relaxed_poscar_placeholder(item.directory / "POSCAR")
+                        else "generated"
+                    ),
+                    "incar_source": (
+                        "relaxation_incar_with_task_edits"
+                        if _is_relaxed_poscar_placeholder(item.directory / "POSCAR")
+                        else "generated"
+                    ),
                     "output_path": item.output_path,
                 }
                 for item in input_sets
@@ -886,7 +1237,14 @@ class VASPAgent:
             "status": "awaiting_approval",
         }
         (self.work_dir / "approval_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        return {"plan_text": plan_text, "plan": steps, "input_sets": input_sets, "manifest": manifest}
+        return {
+            "plan_text": plan_text,
+            "plan": steps,
+            "input_sets": input_sets,
+            "manifest": manifest,
+            "materials_project_available": context["materials_project_available"],
+            "materials_project_status": context["materials_project_status"],
+        }
 
     def _update_run_meta(self, values: Dict[str, Any]) -> None:
         path = self.work_dir / "run_meta.json"
@@ -914,7 +1272,8 @@ class VASPAgent:
                 "",
                 "Approval gate",
                 "-------------",
-                "POSCAR, KPOINTS, and INCAR are generated before execution.",
+                "The initial POSCAR plus all KPOINTS and INCAR files are generated before execution.",
+                "After relaxation, downstream POSCAR files are protected placeholders replaced only by the verified CONTCAR.",
                 "POTCAR is either assembled locally when available or assembled on the cluster before VASP runs.",
                 "No cluster job is submitted until you approve the files.",
             ]
@@ -929,14 +1288,22 @@ class RemoteClusterVASPAgent:
         vasp_agent: VASPAgent,
         transport,
         approval_callback=None,
-        parallel_np: int = 1,
+        plan_approval_callback=None,
+        monitor_callback=None,
+        parallel_np: int = 0,
         vasp_command: str = "",
         slurm_template_path: str = "",
     ):
         self.agent = vasp_agent
         self.transport = transport
         self.approval_callback = approval_callback or _approve_vasp_inputs_popup
-        self.parallel_np = max(1, parallel_np or 1)
+        self.plan_approval_callback = plan_approval_callback
+        self.monitor_callback = monitor_callback
+        template_nodes, template_cores = _vasp_template_resources(
+            slurm_template_path or vasp_agent.slurm_template_path
+        )
+        self.max_nodes = template_nodes
+        self.parallel_np = max(1, parallel_np or template_cores)
         self.default_vasp_command = vasp_command.strip()
         self.slurm_template_path = slurm_template_path or vasp_agent.slurm_template_path
 
@@ -949,19 +1316,81 @@ class RemoteClusterVASPAgent:
         task_type: str = "",
         material_name: str = "",
     ) -> Dict[str, Any]:
-        generated = self.agent.generate_inputs(
+        prepared = self.agent.prepare_workflow(
             query,
             run_id=run_id,
             category=category,
             task_type=task_type,
             material_name=material_name,
         )
-        plan_text = generated["plan_text"]
-        input_sets: List[VASPInputSet] = generated["input_sets"]
+        plan_text = prepared["plan_text"]
+        self._active_query = query
         print("\n" + plan_text)
 
         manifest_path = self.agent.work_dir / "approval_manifest.json"
+        if self.plan_approval_callback is not None:
+            workflow_steps = [
+                {
+                    "id": index,
+                    "tool": str(step.get("task") or "vasp"),
+                    "problem": str(step.get("title") or step.get("task") or f"VASP step {index}"),
+                    "why": str(step.get("why") or ""),
+                }
+                for index, step in enumerate(prepared["steps"], start=1)
+            ]
+            plan_decision = self.plan_approval_callback(
+                plan_text,
+                [],
+                review_stage="plan",
+                workflow_steps=workflow_steps,
+                resource_defaults={"max_nodes": self.max_nodes, "cores_per_node": self.parallel_np},
+                structure_defaults={
+                    "materials_project_available": bool(prepared.get("materials_project_available")),
+                    "materials_project_status": prepared.get("materials_project_status", ""),
+                },
+            )
+            action = plan_decision.get("action", "cancel") if isinstance(plan_decision, dict) else (
+                "approve" if plan_decision else "cancel"
+            )
+            if action != "approve":
+                if action == "revise" and isinstance(plan_decision, dict):
+                    revision = str(plan_decision.get("revision") or "").strip()
+                    (self.agent.work_dir / "plan_revision.json").write_text(
+                        json.dumps({
+                            "query": query,
+                            "comment": revision,
+                            "superseded_run_dir": str(self.agent.work_dir),
+                        }, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    return self.run(
+                        query + "\n\nUSER-REQUESTED SCIENTIFIC/PLAN REVISION (mandatory):\n" + revision,
+                        run_id=run_id,
+                        category=category,
+                        task_type=task_type,
+                        material_name=material_name,
+                    )
+                return {
+                    "status": "cancelled_before_input_generation",
+                    "run_dir": str(self.agent.work_dir),
+                }
+            if isinstance(plan_decision, dict):
+                resources = plan_decision.get("resources") or {}
+                self.parallel_np = max(1, int(resources.get("cores_per_node") or self.parallel_np))
+                self.max_nodes = max(1, int(resources.get("max_nodes") or self.max_nodes))
+                structure = plan_decision.get("structure") or {}
+                if structure.get("source") == "file":
+                    prepared["material_info"] = _vasp_material_info_from_user_structure(
+                        str(structure.get("path") or ""), self.agent.work_dir
+                    )
+
+        generated = self.agent.generate_inputs(query, prepared=prepared)
+        input_sets: List[VASPInputSet] = generated["input_sets"]
         manifest = generated["manifest"]
+        manifest["resources"] = {
+            "max_nodes": self.max_nodes,
+            "cores_per_node": self.parallel_np,
+        }
         if not self.approval_callback(plan_text, input_sets):
             manifest["status"] = "cancelled"
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -974,31 +1403,200 @@ class RemoteClusterVASPAgent:
 
         manifest["status"] = "approved"
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        input_sets = self._materialize_job_directories(input_sets)
+        manifest["jobs"] = [
+            {
+                "step": item.step_index,
+                "task": item.task,
+                "directory": str(item.directory),
+                "output_path": item.output_path,
+                "status": "created",
+            }
+            for item in input_sets
+        ]
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         self._write_slurm_scripts(input_sets)
+        self._write_workflow_state(generated["plan"], input_sets, "approved")
+        if self.monitor_callback is not None:
+            self.monitor_callback(self.agent.work_dir)
         self.transport.ensure_connection()
 
         latest_contcar: Optional[Path] = None
+        latest_scf_remote_dir = ""
+        reference_potcar_hash = ""
         for item in input_sets:
+            task_kind = _vasp_task_kind(item.task)
+            poscar_path = item.directory / "POSCAR"
+            if _is_relaxed_poscar_placeholder(poscar_path) and not (
+                latest_contcar and latest_contcar.exists()
+            ):
+                raise RuntimeError(
+                    f"Step {item.step_index} requires the relaxed CONTCAR, but no "
+                    "completed relaxation structure is available."
+                )
             if latest_contcar and latest_contcar.exists():
-                shutil_path = item.directory / "POSCAR"
-                shutil_path.write_text(latest_contcar.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                shutil.copy2(latest_contcar, poscar_path)
+                materialized_species = _species_from_poscar(
+                    poscar_path.read_text(encoding="utf-8", errors="replace")
+                )
+                if materialized_species != item.species:
+                    raise RuntimeError(
+                        "Relaxed CONTCAR species/order does not match the approved POTCAR "
+                        f"selection for step {item.step_index}."
+                    )
+                job_record_index = item.step_index - 1
+                manifest["jobs"][job_record_index]["poscar_source"] = str(latest_contcar)
                 print(f"[vasp-agent] using relaxed CONTCAR from the previous step as {item.directory.name}/POSCAR")
+            if _is_relaxed_poscar_placeholder(poscar_path):
+                raise RuntimeError(
+                    f"Refusing to submit step {item.step_index} with an unresolved POSCAR placeholder."
+                )
 
-            remote_dir = f"{self.transport.remote_root}/{self.agent.work_dir.name}/{item.directory.name}"
-            self.transport.upload_directory(item.directory, remote_dir)
-            job = self.transport.submit(remote_dir, Path(item.slurm_path).name)
-            print(f"[vasp-agent] submitted {Path(item.slurm_path).name}: {job.submit_output}")
-            self.transport.wait_for_job(job)
-            self.transport.fetch_directory(remote_dir, item.directory)
+            if hasattr(self.transport, "remote_attempt_dir"):
+                remote_dir = self.transport.remote_attempt_dir(
+                    self.agent.work_dir, item.step_index, item.task, 1
+                )
+            else:
+                remote_dir = (
+                    f"{self.transport.remote_root}/{self.agent.work_dir.name}/steps/"
+                    f"{item.step_index:02d}-{_sanitize_name(item.task).lower()}/attempt_001"
+                )
+            job_record = manifest["jobs"][item.step_index - 1]
+            job_record["remote_directory"] = remote_dir
+            job_record["status"] = "preparing"
+            print(
+                f"[cluster] preparing VASP step {item.step_index}: uploading inputs and "
+                "assembling/verifying POTCAR. Slurm job ID is pending until sbatch succeeds."
+            )
+            self._write_workflow_state(
+                generated["plan"], input_sets, "preparing",
+                item.step_index, "preparing",
+            )
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            try:
+                upload_paths = [
+                    str(path) for path in item.directory.iterdir() if path.is_file()
+                ]
+                if hasattr(self.transport, "upload_step_files"):
+                    self.transport.upload_step_files(
+                        item.directory, remote_dir, upload_paths
+                    )
+                else:
+                    self.transport.upload_directory(item.directory, remote_dir)
+                if hasattr(self.transport, "remote_files_ok"):
+                    missing = self.transport.remote_files_ok(remote_dir, upload_paths)
+                    if missing:
+                        raise RuntimeError(
+                            "VASP job upload verification failed:\n" + "\n".join(missing)
+                        )
+                if item.potcar_mode == "remote":
+                    job_record["status"] = "assembling_potcar"
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+                    )
+                    if not hasattr(self.transport, "assemble_remote_vasp_potcar"):
+                        raise RuntimeError(
+                            "The cluster transport cannot assemble a remote VASP POTCAR."
+                        )
+                    self.transport.assemble_remote_vasp_potcar(remote_dir)
+                    if hasattr(self.transport, "remote_files_ok"):
+                        missing = self.transport.remote_files_ok(remote_dir, ["POTCAR"])
+                        if missing:
+                            raise RuntimeError(
+                                "Remote POTCAR assembly verification failed:\n"
+                                + "\n".join(missing)
+                            )
+                    job_record["potcar_status"] = "assembled_and_verified"
+                if hasattr(self.transport, "remote_files_ok"):
+                    missing = self.transport.remote_files_ok(remote_dir, ["POTCAR"])
+                    if missing:
+                        raise RuntimeError(
+                            "VASP POTCAR is missing before submission:\n" + "\n".join(missing)
+                        )
+                if hasattr(self.transport, "remote_file_sha256"):
+                    potcar_hash = self.transport.remote_file_sha256(remote_dir, "POTCAR")
+                    if reference_potcar_hash and potcar_hash != reference_potcar_hash:
+                        raise RuntimeError(
+                            "POTCAR changed between VASP workflow steps; submission blocked."
+                        )
+                    reference_potcar_hash = reference_potcar_hash or potcar_hash
+                    job_record["potcar_sha256"] = potcar_hash
+                if task_kind == "bands":
+                    if not latest_scf_remote_dir:
+                        raise RuntimeError(
+                            "Band calculation requires a completed SCF CHGCAR, but no SCF step completed."
+                        )
+                    if not hasattr(self.transport, "copy_remote_artifacts"):
+                        raise RuntimeError(
+                            "The cluster transport cannot stage CHGCAR for the band calculation."
+                        )
+                    self.transport.copy_remote_artifacts(
+                        latest_scf_remote_dir, remote_dir, ["CHGCAR"]
+                    )
+                    if hasattr(self.transport, "remote_files_ok"):
+                        missing = self.transport.remote_files_ok(remote_dir, ["CHGCAR"])
+                        if missing:
+                            raise RuntimeError(
+                                "Band calculation requires a non-empty SCF CHGCAR:\n"
+                                + "\n".join(missing)
+                            )
+                    job_record["chgcar_source"] = latest_scf_remote_dir + "/CHGCAR"
+                print(
+                    f"[cluster] submitting VASP step {item.step_index} with "
+                    f"{Path(item.slurm_path).name}; waiting for Slurm job ID."
+                )
+                job = self.transport.submit(remote_dir, Path(item.slurm_path).name)
+                job_record["job_id"] = job.job_id
+                job_record["status"] = "submitted"
+                manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+                self._write_workflow_state(
+                    generated["plan"], input_sets, "running",
+                    item.step_index, "submitted", job.job_id,
+                )
+                print(f"[cluster] VASP step {item.step_index} submitted; Slurm job ID: {job.job_id}")
+                print(f"[vasp-agent] sbatch response: {job.submit_output}")
+                self.transport.wait_for_job(job)
+                required_outputs = ["vasp.out"]
+                if task_kind == "vc-relax" or task_kind == "relax":
+                    required_outputs.append("CONTCAR")
+                if task_kind == "scf" and any(
+                    _vasp_task_kind(later.task) == "bands"
+                    for later in input_sets[item.step_index:]
+                ):
+                    required_outputs.append("CHGCAR")
+                if hasattr(self.transport, "remote_files_ok"):
+                    missing = self.transport.remote_files_ok(remote_dir, required_outputs)
+                    if missing:
+                        raise RuntimeError(
+                            "VASP job completed without required outputs:\n" + "\n".join(missing)
+                        )
+                self.transport.fetch_directory(remote_dir, item.directory)
+                job_record["status"] = "completed"
+                self._write_workflow_state(generated["plan"], input_sets, "running", item.step_index, "completed", job.job_id)
+                manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            except Exception as exc:
+                job_record["status"] = "failed"
+                job_record["error"] = str(exc)
+                manifest["status"] = "failed"
+                self._write_workflow_state(generated["plan"], input_sets, "failed", item.step_index, "failed")
+                manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+                raise
+            if task_kind == "scf":
+                latest_scf_remote_dir = remote_dir
             contcar = item.directory / "CONTCAR"
-            if item.task in {"relax", "vc-relax"} and contcar.exists() and contcar.stat().st_size > 0:
+            if task_kind in {"relax", "vc-relax"} and contcar.exists() and contcar.stat().st_size > 0:
                 latest_contcar = contcar
+                # Any charge density produced before this geometry is stale.
+                latest_scf_remote_dir = ""
 
         analysis = self._summarize_outputs(query, input_sets)
         (self.agent.work_dir / "analysis.json").write_text(
             json.dumps({"query": query, "analysis": analysis}, indent=2) + "\n",
             encoding="utf-8",
         )
+        manifest["status"] = "completed"
+        self._write_workflow_state(generated["plan"], input_sets, "completed")
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         return {
             "status": "success",
             "run_dir": str(self.agent.work_dir),
@@ -1014,22 +1612,106 @@ class RemoteClusterVASPAgent:
             "analysis": analysis,
         }
 
+    def _write_workflow_state(
+        self,
+        plan: List[Dict[str, Any]],
+        input_sets: List[VASPInputSet],
+        workflow_status: str,
+        active_step: int = 0,
+        step_status: str = "",
+        job_id: str = "",
+    ) -> None:
+        path = self.agent.work_dir / "workflow_state.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except (OSError, ValueError):
+            state = {}
+        old_steps = {int(step.get("id", 0)): step for step in state.get("steps", [])}
+        steps = []
+        for item, planned in zip(input_sets, plan):
+            old = old_steps.get(item.step_index, {})
+            status = old.get("status", "pending")
+            if item.step_index == active_step and step_status:
+                status = step_status
+            jobs = list(old.get("job_ids", []))
+            if item.step_index == active_step and job_id and job_id not in jobs:
+                jobs.append(job_id)
+            steps.append({
+                "id": item.step_index,
+                "problem": item.title,
+                "tool": item.task,
+                "branch": item.task,
+                "status": status,
+                "attempts": 1 if status in {"running", "submitted", "completed", "failed"} else 0,
+                "job_ids": jobs,
+            })
+        payload = {
+            "version": 1,
+            "query": state.get("query") or getattr(self, "_active_query", ""),
+            "run_dir": str(self.agent.work_dir),
+            "status": workflow_status,
+            "plan": plan,
+            "packages": [],
+            "steps": steps,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+
+    def _materialize_job_directories(
+        self, input_sets: List[VASPInputSet]
+    ) -> List[VASPInputSet]:
+        """Copy approved VASP inputs into immutable QE-style job directories."""
+        jobs: List[VASPInputSet] = []
+        for item in input_sets:
+            task_name = _sanitize_name(item.task).lower() or "vasp"
+            job_dir = (
+                self.agent.work_dir
+                / "attempts"
+                / f"{item.step_index:02d}-{task_name}"
+                / "attempt_001"
+            )
+            job_dir.mkdir(parents=True, exist_ok=False)
+            for source in item.directory.iterdir():
+                if source.is_file():
+                    shutil.copy2(source, job_dir / source.name)
+            files = [
+                str(job_dir / Path(path).name)
+                for path in item.files
+                if (job_dir / Path(path).name).is_file()
+            ]
+            jobs.append(
+                VASPInputSet(
+                    step_index=item.step_index,
+                    title=item.title,
+                    task=item.task,
+                    directory=job_dir,
+                    files=files,
+                    species=list(item.species),
+                    output_path=str(job_dir / "vasp.out"),
+                    potcar_mode=item.potcar_mode,
+                )
+            )
+        return jobs
+
     def _write_slurm_scripts(self, input_sets: List[VASPInputSet]) -> None:
         for item in input_sets:
             command = self._vasp_command()
             command_line = f"{command} > $OUTPUT"
-            if item.potcar_mode == "remote":
-                command_line = "./assemble_potcar.sh\n" + command_line
             script = render_slurm_script(
                 exec_path=self._vasp_executable_name(),
                 input_path="POSCAR",
                 output_path="vasp.out",
                 command_line=command_line,
-                nodes=1,
+                nodes=self.max_nodes,
                 tasks_per_node=self.parallel_np,
                 work_dir=".",
                 time_limit="01:00:00",
                 template_path=self.slurm_template_path,
+                preserve_template_launcher_options=True,
+                preserve_template_resources=False,
+                preserve_template_logs=True,
             )
             path = item.directory / "run_vasp.slurm"
             path.write_text(script.rstrip() + "\n", encoding="utf-8")

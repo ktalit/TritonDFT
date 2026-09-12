@@ -38,6 +38,18 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual(by_id[11], [10])
         self.assertEqual(by_id[12], [11])
 
+    def test_vasp_task_names_use_the_shared_dependency_graph(self):
+        plan = [
+            {"id": 1, "tool": "vc-relax", "problem": "relax"},
+            {"id": 2, "tool": "scf", "problem": "SCF"},
+            {"id": 3, "tool": "bands", "problem": "bands"},
+            {"id": 4, "tool": "dos", "problem": "DOS"},
+        ]
+        dependencies = infer_dependencies(plan)
+        by_id = {step["id"]: parents for step, parents in zip(plan, dependencies)}
+        self.assertEqual(by_id, {1: [], 2: [1], 3: [2], 4: [2]})
+        self.assertEqual(infer_branches(plan), ["core", "core", "bands", "dos_pdos"])
+
     def test_post_scf_work_cannot_run_early_when_plan_text_is_misordered(self):
         plan = [
             {"id": 1, "tool": "pw_bands", "problem": "bands listed too early"},

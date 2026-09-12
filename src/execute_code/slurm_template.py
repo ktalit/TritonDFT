@@ -32,6 +32,9 @@ def render_slurm_script(
     work_dir: str,
     time_limit: str = "00:10:00",
     template_path: str = "",
+    preserve_template_launcher_options: bool = False,
+    preserve_template_resources: bool = False,
+    preserve_template_logs: bool = False,
 ) -> str:
     if template_path:
         template_text = _read_template(template_path)
@@ -46,6 +49,9 @@ def render_slurm_script(
                 tasks_per_node=tasks_per_node,
                 work_dir=work_dir,
                 time_limit=time_limit,
+                preserve_template_launcher_options=preserve_template_launcher_options,
+                preserve_template_resources=preserve_template_resources,
+                preserve_template_logs=preserve_template_logs,
             )
 
     return SLURM_TEMPLATE.format(
@@ -82,16 +88,25 @@ def _render_from_example(
     tasks_per_node: int,
     work_dir: str,
     time_limit: str,
+    preserve_template_launcher_options: bool = False,
+    preserve_template_resources: bool = False,
+    preserve_template_logs: bool = False,
 ) -> str:
     lines = template_text.splitlines()
-    command_line = _preserve_template_launcher(lines, command_line)
-    lines = _replace_or_add_sbatch(lines, ["--nodes"], str(nodes))
-    lines = _replace_or_add_sbatch(lines, ["--tasks-per-node"], str(tasks_per_node))
-    if any(re.match(r"^\s*#SBATCH\s+--ntasks(?:=|\s+)", line) for line in lines):
-        lines = _replace_or_add_sbatch(lines, ["--ntasks"], str(nodes * tasks_per_node))
-    lines = _replace_or_add_sbatch(lines, ["-t", "--time"], time_limit, preferred="-t")
-    lines = _replace_or_add_sbatch(lines, ["-o", "--output"], os.path.join(work_dir, "qe.out"), preferred="-o")
-    lines = _replace_or_add_sbatch(lines, ["-e", "--error"], os.path.join(work_dir, "qe.err"), preferred="-e")
+    command_line = _preserve_template_launcher(
+        lines, command_line, preserve_options=preserve_template_launcher_options
+    )
+    if not preserve_template_resources:
+        lines = _replace_or_add_sbatch(lines, ["--nodes"], str(nodes))
+        lines = _replace_or_add_sbatch(
+            lines, ["--tasks-per-node", "--ntasks-per-node"], str(tasks_per_node)
+        )
+        if any(re.match(r"^\s*#SBATCH\s+--ntasks(?:=|\s+)", line) for line in lines):
+            lines = _replace_or_add_sbatch(lines, ["--ntasks"], str(nodes * tasks_per_node))
+        lines = _replace_or_add_sbatch(lines, ["-t", "--time"], time_limit, preferred="-t")
+    if not preserve_template_logs:
+        lines = _replace_or_add_sbatch(lines, ["-o", "--output"], os.path.join(work_dir, "qe.out"), preferred="-o")
+        lines = _replace_or_add_sbatch(lines, ["-e", "--error"], os.path.join(work_dir, "qe.err"), preferred="-e")
 
     lines = _strip_old_qe_command_block(lines)
     block = [
@@ -105,7 +120,9 @@ def _render_from_example(
     return "\n".join(lines + block).strip()
 
 
-def _preserve_template_launcher(lines: list[str], command_line: str) -> str:
+def _preserve_template_launcher(
+    lines: list[str], command_line: str, *, preserve_options: bool = False
+) -> str:
     """Keep the site's active srun/mpirun launcher while replacing its rank count."""
     active = next(
         (line.strip() for line in lines
@@ -114,6 +131,11 @@ def _preserve_template_launcher(lines: list[str], command_line: str) -> str:
     )
     if not active:
         return command_line
+    if preserve_options:
+        preserved = re.sub(r"\bvasp_(?:std|gam|ncl)\b|\$exe\b", "$exe", active, count=1, flags=re.I)
+        if preserved == active:
+            return command_line
+        return re.sub(r">\s*[^\s]+", "> $OUTPUT", preserved, count=1)
     template_family = re.match(r"^(srun|mpirun|mpiexec)\b", active, re.I).group(1).lower()
     generated_family = re.search(r"(?:^|[;|]\s*)(srun|mpirun|mpiexec)\b", command_line, re.I)
     if not generated_family or generated_family.group(1).lower() == template_family:
@@ -170,6 +192,7 @@ def _strip_old_qe_command_block(lines: list[str]) -> list[str]:
         re.compile(r"^\s*OUTPUT\s*=", re.IGNORECASE),
         re.compile(r"^\s*(mpirun|mpiexec|srun)\b.*\s-in\s+", re.IGNORECASE),
         re.compile(r"^\s*(mpirun|mpiexec|srun)\b.*\$(exe|INPUT|OUTPUT)\b", re.IGNORECASE),
+        re.compile(r"^\s*(mpirun|mpiexec|srun)\b.*\bvasp_(std|gam|ncl)\b", re.IGNORECASE),
         re.compile(r"^\s*(pw\.x|bands\.x|dos\.x|projwfc\.x|ph\.x|pp\.x)\b.*\s-in\s+", re.IGNORECASE),
     ]
     for line in lines:
