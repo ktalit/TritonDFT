@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import copy
 import difflib
+import getpass
 import json
 import os
 import re
@@ -13,6 +14,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import yaml
 
 from DFTAgent import DFTAgent
 from prompt import get_prompt
@@ -51,6 +54,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_USER_QE_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_qe_slurm_job_file.txt")
 DEFAULT_USER_VASP_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_vasp_slurm_job_file.txt")
 DEFAULT_USER_ENV_FILE = str(PROJECT_ROOT / ".tritondft" / ".env.cluster")
+DEFAULT_USER_CONFIG_FILE = "~/.tritondft/config.yaml"
 ADMIN_PROVIDER_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -109,14 +113,138 @@ def _read_env_file(path: str) -> Dict[str, str]:
     return data
 
 
+def _load_user_cluster_config(path: str) -> Dict[str, Any]:
+    """Load one user's selected cluster profile into the existing env contract."""
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        return {}
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"TritonDFT user config must contain a YAML mapping: {config_path}")
+
+    selected = str(data.get("active_cluster", "")).strip()
+    clusters = data.get("clusters", {}) or {}
+    if not isinstance(clusters, dict):
+        raise ValueError(f"The 'clusters' section must be a YAML mapping: {config_path}")
+    if not selected and len(clusters) == 1:
+        selected = next(iter(clusters))
+    profile = clusters.get(selected, {}) if selected else {}
+    if not isinstance(profile, dict):
+        raise ValueError(f"Cluster profile '{selected}' must be a YAML mapping: {config_path}")
+
+    api_keys = data.get("api_keys", {}) or {}
+    defaults = data.get("defaults", {}) or {}
+    if not isinstance(api_keys, dict) or not isinstance(defaults, dict):
+        raise ValueError(f"'api_keys' and 'defaults' must be YAML mappings: {config_path}")
+
+    values = {
+        "OPENAI_API_KEY": api_keys.get("openai", data.get("openai_api_key", "")),
+        "MP_API_KEY": api_keys.get("materials_project", data.get("mp_api_key", "")),
+        "CLUSTER_AGENT_CLUSTER": selected,
+        "CLUSTER_AGENT_USER_ID": profile.get("user_id", ""),
+        "CLUSTER_AGENT_SSH_TARGET": profile.get("ssh_alias", ""),
+        "CLUSTER_AGENT_REMOTE_ROOT": profile.get("remote_working_directory", ""),
+        "CLUSTER_AGENT_MODEL": defaults.get("model", ""),
+        "CLUSTER_AGENT_BACKEND": defaults.get("backend", ""),
+        "CLUSTER_AGENT_WORK_DIR": defaults.get("work_dir", ""),
+        "CLUSTER_AGENT_POLL_SECONDS": defaults.get("poll_seconds", ""),
+        "TRITONDFT_QE_SLURM_TEMPLATE": profile.get("qe_slurm_script", ""),
+        "TRITONDFT_VASP_SLURM_TEMPLATE": profile.get("vasp_slurm_script", ""),
+        "CLUSTER_AGENT_REMOTE_QE_BIN_DIR": profile.get("remote_qe_bin_dir", ""),
+        "CLUSTER_AGENT_REMOTE_VASP_COMMAND": profile.get("remote_vasp_command", ""),
+        "CLUSTER_AGENT_VASP_POTCAR_ROOT": profile.get(
+            "remote_vasp_potcar_root",
+            profile.get("vasp_potcar_root", ""),
+        ),
+        "CLUSTER_AGENT_VASP_FUNCTIONAL": profile.get("vasp_functional", ""),
+        "CLUSTER_AGENT_NO_QUERY_INFO": defaults.get("no_query_info", ""),
+        "CLUSTER_AGENT_DFT_CODE": defaults.get("dft_code", ""),
+    }
+    user_id = str(profile.get("user_id", "")).strip()
+    hostname = str(profile.get("hostname", "")).strip()
+    if user_id and hostname:
+        values["CLUSTER_AGENT_SSH_TARGET"] = f"{user_id}@{hostname}"
+    result = {key: str(value).strip() for key, value in values.items() if value not in (None, "")}
+    if "openai" in api_keys:
+        result["OPENAI_API_KEY"] = str(api_keys.get("openai") or "").strip()
+    if "materials_project" in api_keys:
+        result["MP_API_KEY"] = str(api_keys.get("materials_project") or "").strip()
+    return result
+
+
+def _load_user_cluster_config_into_environment(path: str) -> Dict[str, str]:
+    values = _load_user_cluster_config(path)
+    for key, value in values.items():
+        os.environ[key] = value
+    return values
+
+
+def _create_user_config(path: str) -> None:
+    config_path = Path(path).expanduser()
+    if config_path.exists():
+        return
+    config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_path.write_text(
+        "# Edit this file once for your TritonDFT cluster access.\n"
+        "# Add another entry under clusters for a different cluster.\n"
+        "active_cluster: my_cluster\n"
+        "api_keys:\n"
+        "  openai: \"\"\n"
+        "  materials_project: \"\"\n"
+        "defaults:\n"
+        "  model: gpt-4o\n"
+        "  backend: openai\n"
+        "  work_dir: tmp\n"
+        "  poll_seconds: 30\n"
+        "  dft_code: qe\n"
+        "clusters:\n"
+        "  my_cluster:\n"
+        "    user_id: your_cluster_user\n"
+        "    hostname: login.example.edu\n"
+        "    remote_working_directory: /scratch/$USER/tritondft_runs\n"
+        "    ssh_alias: my_cluster\n"
+        "    qe_slurm_script: ~/.tritondft/slurm/my_cluster-qe.sh\n"
+        "    vasp_slurm_script: ~/.tritondft/slurm/my_cluster-vasp.sh\n"
+        "    remote_qe_bin_dir: \"\"\n"
+        "    remote_vasp_potcar_root: /home/your_cluster_user/VASP_PP\n",
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    print(f"[cluster-agent] Created user configuration template: {config_path}")
+
+
 def _locked_admin_provider(path: str) -> Dict[str, str]:
-    """Return admin-owned provider settings when central locking is enabled."""
+    """Return admin settings only when the current user is approved."""
     data = _read_env_file(path)
     locked = data.get("TRITONDFT_ADMIN_LOCK_PROVIDER", "").strip().lower() in {
         "1", "true", "yes", "on",
     }
     if not locked:
         return {}
+    approved_file = data.get("TRITONDFT_ADMIN_APPROVED_USER_IDS", "").strip()
+    if approved_file:
+        approved_path = Path(approved_file).expanduser()
+        if not approved_path.is_file():
+            raise ValueError(
+                "TRITONDFT_ADMIN_APPROVED_USER_IDS points to a missing file: "
+                f"{approved_path}"
+            )
+        approved = {
+            line.strip()
+            for line in approved_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        current_users = {
+            value.strip()
+            for value in (
+                getpass.getuser(),
+                os.environ.get("USER", ""),
+                os.environ.get("CLUSTER_AGENT_USER_ID", ""),
+            )
+            if value.strip()
+        }
+        if not approved.intersection(current_users):
+            return {}
     missing = [
         key for key in ("OPENAI_API_KEY", "MP_API_KEY", "CLUSTER_AGENT_MODEL", "CLUSTER_AGENT_BACKEND")
         if not data.get(key, "").strip()
@@ -202,7 +330,13 @@ def _env_missing_cluster_setup(path: str, *, include_environment: bool = False) 
         ) if os.environ.get(key)}}
     ssh_target = data.get("CLUSTER_AGENT_SSH_TARGET", "").strip()
     remote_root = data.get("CLUSTER_AGENT_REMOTE_ROOT", "").strip()
-    if not ssh_target or not remote_root:
+    if (
+        not ssh_target
+        or not remote_root
+        or "your_cluster_user" in ssh_target
+        or "login.example.edu" in ssh_target
+        or "your_user" in remote_root
+    ):
         return True
     if _ssh_target_needs_user_config(ssh_target):
         print(
@@ -4046,14 +4180,12 @@ class RemoteClusterDFTAgent:
 
 def _prompt_remote_root(current: str = "") -> str:
     current = (current or "").strip()
+    if current:
+        return current.rstrip("/")
     while True:
-        if current:
-            entered = input(f"Remote cluster parent directory [{current}]: ").strip()
-            remote_root = entered or current
-        else:
-            remote_root = input(
-                "Remote cluster parent directory, e.g. /scratch/$USER/qe_jobs: "
-            ).strip()
+        remote_root = input(
+            "Remote cluster parent directory, e.g. /scratch/$USER/qe_jobs: "
+        ).strip()
 
         if not remote_root:
             print("Please enter a remote directory path where you have write permission.")
@@ -4094,6 +4226,11 @@ def _prompt_dft_code(default: str = "") -> str:
 
 def _prompt_vasp_potcar_root(current: str = "") -> str:
     current = (current or os.environ.get("VASP_POTCAR_ROOT", "") or os.environ.get("VASP_PP_PATH", "")).strip()
+    if not current:
+        raise ValueError(
+            "VASP requires a remote POTCAR tree. Set "
+            "clusters.<active_cluster>.remote_vasp_potcar_root in ~/.tritondft/config.yaml."
+        )
     while True:
         if current:
             entered = input(f"Licensed VASP POTCAR root on local machine or cluster [{current}]: ").strip()
@@ -4120,17 +4257,30 @@ def interactive_main() -> None:
         default=os.environ.get("CLUSTER_AGENT_ENV_FILE", DEFAULT_USER_ENV_FILE),
         help="Local env file with cluster-agent defaults and API keys",
     )
+    env_parser.add_argument(
+        "--config-file",
+        default=os.environ.get("CLUSTER_AGENT_CONFIG_FILE", DEFAULT_USER_CONFIG_FILE),
+        help="Private home-directory YAML file containing cluster profiles and user settings",
+    )
     env_args, remaining_args = env_parser.parse_known_args()
+    user_config_exists = Path(env_args.config_file).expanduser().exists()
     if "-h" not in remaining_args and "--help" not in remaining_args:
+        _create_user_config(env_args.config_file)
         _initialize_user_config(env_args.env_file)
     _load_env_file(".env")
     _load_env_file(env_args.admin_env_file, override=True)
     _load_env_file(env_args.env_file, override=True)
+    _load_user_cluster_config_into_environment(env_args.config_file)
     locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
 
     if "-h" not in remaining_args and "--help" not in remaining_args:
         print(WELCOME_BANNER, flush=True)
         if _env_missing_cluster_setup(env_args.env_file, include_environment=True):
+            if user_config_exists or not Path(env_args.env_file).expanduser().exists():
+                raise ValueError(
+                    f"Complete the selected cluster profile in {Path(env_args.config_file).expanduser()} "
+                    "(user_id, hostname, and remote_working_directory are required)."
+                )
             _run_super_user_setup(env_args.env_file)
             _load_env_file(env_args.env_file, override=True)
 
@@ -4139,16 +4289,15 @@ def interactive_main() -> None:
         locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
 
         if _env_missing_api_keys(env_args.env_file, include_environment=True):
-            print(
-                f"\nPlease modify {env_args.env_file} with your OPENAI_API_KEY "
-                "and MP_API_KEY before running TritonDFT."
+            raise ValueError(
+                f"Set api_keys.openai and api_keys.materials_project in "
+                f"{Path(env_args.config_file).expanduser()} or provide administrator-managed keys."
             )
-            input("Press Enter after you have saved the file...")
-            _load_env_file(env_args.env_file, override=True)
 
     parser = argparse.ArgumentParser(description="Interactive local-to-Slurm DFT cluster agent")
     parser.add_argument("--admin-env-file", default=env_args.admin_env_file, help="Optional administrator defaults env file")
     parser.add_argument("--env-file", default=env_args.env_file, help="Local env file with cluster-agent defaults and API keys")
+    parser.add_argument("--config-file", default=env_args.config_file, help="Private YAML cluster profile file")
     parser.add_argument(
         "--ssh-target",
         default=os.environ.get("CLUSTER_AGENT_SSH_TARGET", ""),

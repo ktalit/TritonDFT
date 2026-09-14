@@ -1,0 +1,4 @@
+# One approved local or cluster user ID per line.
+# Blank lines and lines beginning with '#' are ignored.
+alice
+bob

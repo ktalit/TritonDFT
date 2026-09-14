@@ -1,0 +1,57 @@
+# Copy to ~/.tritondft/config.yaml and edit this one file.
+# This file is stored on the TritonDFT cluster, not on the compute cluster.
+# Keep it private because api_keys may contain credentials.
+active_cluster: expanse
+
+api_keys:
+  # These are used only when the administrator has not locked provider keys.
+  openai: ""
+  materials_project: ""
+
+defaults:
+  model: gpt-4o
+  backend: openai
+  work_dir: tmp
+  poll_seconds: 30
+  # Use qe, vasp, or both. Only the selected code's settings are required.
+  dft_code: qe
+
+  # TritonDFT uses SSH keys for unattended access; no OTP is configured here.
+  # The key used for TritonDFT -> compute-cluster access is configured in the
+  # TritonDFT cluster user's ~/.ssh/config or SSH agent.
+  ssh_authentication: public_key
+
+clusters:
+  expanse:
+    # Username on the remote compute cluster, not the TritonDFT cluster.
+    user_id: your_cluster_user
+    hostname: login.expanse.sdsc.edu
+    # The agent connects to user_id@hostname. Keep this alias only if it is
+    # already defined in ~/.ssh/config on the TritonDFT cluster.
+    ssh_alias: expanse
+    # The private key must remain on the TritonDFT cluster. Do not put its
+    # contents in this YAML file or copy it to users.
+    remote_working_directory: /scratch/$USER/tritondft_runs
+
+    # Required when dft_code is qe or both.
+    qe_slurm_script: ~/.tritondft/slurm/expanse-qe.sh
+    remote_qe_bin_dir: ""
+
+    # Required when dft_code is vasp or both.
+    vasp_slurm_script: ~/.tritondft/slurm/expanse-vasp.sh
+    remote_vasp_command: ""
+    # Remote licensed VASP POTCAR tree. Expected layout:
+    #   /home/your_cluster_user/VASP_PP/PBE/Si/POTCAR
+    #   /home/your_cluster_user/VASP_PP/LDA/Si/POTCAR
+    remote_vasp_potcar_root: /home/your_cluster_user/VASP_PP
+    vasp_functional: ""
+
+  # Add another cluster here, then change active_cluster when needed.
+  # another_cluster:
+  #   user_id: another_user
+  #   hostname: login.another.example
+  #   remote_working_directory: /scratch/$USER/tritondft_runs
+  #   qe_slurm_script: ~/.tritondft/slurm/another-qe.sh
+  #   vasp_slurm_script: ~/.tritondft/slurm/another-vasp.sh
+  #   remote_qe_bin_dir: ""
+  #   remote_vasp_potcar_root: /home/another_user/VASP_PP

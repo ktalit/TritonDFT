@@ -24,6 +24,9 @@ from cluster_agent import (
     _env_missing_cluster_setup,
     _env_missing_api_keys,
     _apply_locked_admin_provider,
+    _locked_admin_provider,
+    _load_user_cluster_config,
+    _prompt_remote_root,
     _extract_relaxed_structure,
     _ensure_env_defaults,
     _input_validation_errors,
@@ -45,6 +48,13 @@ from cluster_agent import (
     _declared_result_artifacts,
     _material_info_from_user_structure,
     _verified_relaxed_structure_from_state,
+)
+from vasp_agent import (
+    RemoteClusterVASPAgent,
+    VASPAgent,
+    _approve_vasp_inputs_popup,
+    _functional_root_names,
+    _write_remote_potcar_assembler,
 )
 from execute_code.slurm import SlurmLauncher
 from execute_code.slurm import _create_probe_script, _ensure_parameter, _enforce_safe_qe_parallel_flags
@@ -101,6 +111,54 @@ JOB DONE.
 
 
 class PlaceholderTests(unittest.TestCase):
+    def test_remote_potcar_assembler_selects_functional_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "assemble_potcar.sh"
+            _write_remote_potcar_assembler(
+                destination=script,
+                species=["Si", "O"],
+                potcar_root="/home/ktalit/VASP_PP",
+                functional="PBE",
+            )
+            text = script.read_text(encoding="utf-8")
+
+        self.assertEqual(_functional_root_names("PBE"), ["potpaw_PBE", "PBE", "pbe"])
+        self.assertIn('BASES+=("$POTCAR_ROOT/$root_name")', text)
+        self.assertIn('POTCAR_ROOT=/home/ktalit/VASP_PP', text)
+        self.assertIn('FUNCTIONAL=PBE', text)
+
+    def test_home_yaml_selects_cluster_profile_and_maps_all_user_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.yaml"
+            config.write_text(
+                "active_cluster: gpu\n"
+                "api_keys:\n"
+                "  openai: user-openai\n"
+                "  materials_project: user-mp\n"
+                "defaults:\n"
+                "  dft_code: vasp\n"
+                "clusters:\n"
+                "  gpu:\n"
+                "    user_id: alice\n"
+                "    hostname: login.gpu.example\n"
+                "    remote_working_directory: /scratch/alice/runs\n"
+                "    qe_slurm_script: ~/.tritondft/slurm/gpu-qe.sh\n"
+                "    vasp_slurm_script: ~/.tritondft/slurm/gpu-vasp.sh\n",
+                encoding="utf-8",
+            )
+            values = _load_user_cluster_config(str(config))
+
+        self.assertEqual(values["OPENAI_API_KEY"], "user-openai")
+        self.assertEqual(values["MP_API_KEY"], "user-mp")
+        self.assertEqual(values["CLUSTER_AGENT_SSH_TARGET"], "alice@login.gpu.example")
+        self.assertEqual(values["CLUSTER_AGENT_REMOTE_ROOT"], "/scratch/alice/runs")
+        self.assertEqual(values["TRITONDFT_VASP_SLURM_TEMPLATE"], "~/.tritondft/slurm/gpu-vasp.sh")
+        self.assertEqual(values["CLUSTER_AGENT_VASP_POTCAR_ROOT"], "")
+        self.assertEqual(values["CLUSTER_AGENT_DFT_CODE"], "vasp")
+
+    def test_configured_remote_root_is_not_prompted_again(self):
+        self.assertEqual(_prompt_remote_root("/scratch/alice/runs"), "/scratch/alice/runs")
+
     def test_verified_relaxed_geometry_is_reextracted_from_output_not_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -305,6 +363,42 @@ class PlaceholderTests(unittest.TestCase):
             }, clear=False):
                 self.assertFalse(_env_missing_api_keys(missing, include_environment=True))
                 self.assertTrue(_env_missing_api_keys(missing, include_environment=False))
+
+    def test_admin_approved_user_ids_are_read_one_per_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            approved_file = Path(tmp) / "approved_user_ids.txt"
+            approved_file.write_text("# workshop users\n alice \n\n bob\n", encoding="utf-8")
+            admin = Path(tmp) / ".env.cluster_admin"
+            admin.write_text(
+                "TRITONDFT_ADMIN_LOCK_PROVIDER=true\n"
+                f"TRITONDFT_ADMIN_APPROVED_USER_IDS={approved_file}\n"
+                "OPENAI_API_KEY=admin-key\nMP_API_KEY=admin-mp-key\n"
+                "CLUSTER_AGENT_MODEL=admin-model\nCLUSTER_AGENT_BACKEND=openai\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"USER": "bob", "CLUSTER_AGENT_USER_ID": "bob"}, clear=False), \
+                    patch("cluster_agent.getpass.getuser", return_value="bob"):
+                self.assertEqual(_locked_admin_provider(str(admin))["OPENAI_API_KEY"], "admin-key")
+
+    def test_admin_keys_require_an_approved_user_when_allowlist_is_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            admin = Path(tmp) / ".env.cluster_admin"
+            admin.write_text(
+                "TRITONDFT_ADMIN_LOCK_PROVIDER=true\n"
+                "TRITONDFT_ADMIN_APPROVED_USER_IDS=approved-user\n"
+                "OPENAI_API_KEY=admin-key\n"
+                "MP_API_KEY=admin-mp-key\n"
+                "CLUSTER_AGENT_MODEL=admin-model\n"
+                "CLUSTER_AGENT_BACKEND=openai\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"USER": "unapproved-user", "CLUSTER_AGENT_USER_ID": "unapproved-user"}, clear=False), \
+                    patch("cluster_agent.getpass.getuser", return_value="unapproved-user"):
+                self.assertEqual(_locked_admin_provider(str(admin)), {})
+
+            with patch.dict(os.environ, {"USER": "approved-user", "CLUSTER_AGENT_USER_ID": "approved-user"}, clear=False), \
+                    patch("cluster_agent.getpass.getuser", return_value="approved-user"):
+                self.assertEqual(_locked_admin_provider(str(admin))["OPENAI_API_KEY"], "admin-key")
 
     def test_locked_admin_provider_overrides_user_environment(self):
         with tempfile.TemporaryDirectory() as tmp:

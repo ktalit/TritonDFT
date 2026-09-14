@@ -107,27 +107,36 @@ run directory.
 bash scripts/run_cluster_agent.sh
 ```
 
-On the first run for each Linux user, TritonDFT checks that the user's own
-cluster setup exists. If the project-local `.tritondft/.env.cluster` is missing, incomplete, or
-points to an SSH alias that is not present in that user's `~/.ssh/config`,
-TritonDFT asks for the cluster nickname, login hostname, cluster user id, and
-remote working directory. It then creates/reuses that user's SSH config entry,
-writes the cluster defaults to `.tritondft/.env.cluster`, and asks the user to
-add `OPENAI_API_KEY` and `MP_API_KEY` before continuing.
+On the first run for each Linux user, TritonDFT creates
+`~/.tritondft/config.yaml`. Copy the schema from
+`config/cluster_agent_config.example.yaml` and edit this one file. It contains
+the selected cluster, cluster user id, login hostname, remote working directory,
+QE/VASP Slurm script paths, and optional user API keys. Add more named entries
+under `clusters` for accounts on different clusters and change `active_cluster`
+to select one; TritonDFT does not ask for these values again.
 
-Each user keeps separate QE and VASP Slurm templates at
-`.tritondft/example_qe_slurm_job_file.txt` and
-`.tritondft/example_vasp_slurm_job_file.txt`. Edit them with the cluster's
-normal account, partition, submission header, and module commands. TritonDFT
-creates both starter files automatically and uses the appropriate one for each
-generated job.
+The administrator can provide `OPENAI_API_KEY` and `MP_API_KEY` through the
+central administrator env file. When `TRITONDFT_ADMIN_LOCK_PROVIDER=true`,
+those administrator keys override the user's YAML keys and are never copied to
+the user's configuration. Set `TRITONDFT_ADMIN_APPROVED_USER_IDS` to a text
+file containing one approved local or cluster user ID per line; users outside
+that file must provide their own keys. Blank lines and lines beginning with `#`
+are ignored. Keep both the administrator file and ID list readable only by the
+cluster-agent service account.
 
-The `.env.cluster` file is ignored by Git because it can contain API keys. The
-`CLUSTER_AGENT_SSH_TARGET` value can be an alias from `~/.ssh/config` or
-`user@hostname`.
-The agent asks for the remote parent directory at startup and before each DFT
-request; use a scratch/project path where your cluster user has write
-permission, such as `/scratch/$USER/qe_jobs`.
+Each cluster profile selects its own QE and VASP Slurm templates. Edit those
+scripts with the cluster's account, partition, submission header, and module
+commands; the active profile determines which scripts are used.
+
+For VASP, set `remote_vasp_potcar_root` to the licensed POTCAR tree on the
+remote compute cluster, for example `/home/your_cluster_user/VASP_PP`. The
+agent uploads an assembler script and builds `POTCAR` on that cluster; it does
+not require the proprietary potentials on the local machine.
+
+The older `.env.cluster` format remains supported for migration and command-line
+overrides, but new installations should use the home-directory YAML file. The
+agent uses `user_id@hostname` directly when both are configured, so an SSH alias
+is optional.
 The agent opens a persistent SSH ControlMaster connection by default so repeated
 uploads, submissions, queue checks, and downloads reuse the same login session.
 If `module load quantum-espresso` does not expose `pw.x` on the cluster `PATH`,
