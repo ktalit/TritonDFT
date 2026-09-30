@@ -10,10 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy==1.26.4",
-  "torch",
-  "transformers",
   "openai",
-  "mpcontribs-client",
   "pymatgen==2025.10.7",
   "emmet-core==0.85.1",
   "mp-api==0.45.13",
@@ -23,6 +20,14 @@ dependencies = [
   "anthropic",
   "google-generativeai",
   "tiktoken",
+]
+
+[project.optional-dependencies]
+local-llm = [
+  "torch",
+  "transformers",
+]
+server = [
   "slowapi",
   "sqlalchemy>=2.0",
   "psycopg[binary]>=3.1",
@@ -30,6 +35,9 @@ dependencies = [
   "pydantic[email]",
   "resend",
   "python-dotenv",
+]
+contrib = [
+  "mpcontribs-client",
 ]
 
 [project.scripts]
