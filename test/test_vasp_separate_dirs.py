@@ -8,6 +8,7 @@ from src.vasp_agent import (
     VASP_RELAXED_POSCAR_PLACEHOLDER,
     VASPInputSet,
     _apply_default_vasp_relaxation,
+    _band_kpoints_validation_errors,
     _derive_downstream_incar,
     _enforce_vasp_workflow_incar,
     _is_relaxed_poscar_placeholder,
@@ -18,6 +19,46 @@ from src.execute_code.slurm_template import render_slurm_script
 
 
 class VASPStepDirectoryNamingTests(unittest.TestCase):
+    def test_valid_band_kpoints_uses_endpoint_pairs(self):
+        text = """Band structure
+101
+Line-mode
+reciprocal
+0 0 0 ! Gamma
+0.5 0 0 ! X
+
+0.5 0 0 ! X
+0.5 0.5 0 ! M
+"""
+        self.assertEqual(_band_kpoints_validation_errors(text), [])
+
+    def test_band_kpoints_rejects_weight_and_unpaired_node_list(self):
+        text = """Band structure
+101
+Line-mode
+reciprocal
+0 0 0 10 ! Gamma
+0.5 0 0 10 ! X
+0.5 0.5 0 10 ! M
+"""
+        errors = _band_kpoints_validation_errors(text)
+        self.assertTrue(any("exactly two endpoint" in error for error in errors))
+        self.assertTrue(any("exactly three coordinates" in error for error in errors))
+
+    def test_band_kpoints_rejects_bad_header_coordinates_and_labels(self):
+        text = """Band structure
+1.5
+automatic
+unknown
+zero 0 0
+0.5 0 0 ! X
+"""
+        errors = _band_kpoints_validation_errors(text)
+        self.assertTrue(any("line 2" in error for error in errors))
+        self.assertTrue(any("line 3" in error for error in errors))
+        self.assertTrue(any("line 4" in error for error in errors))
+        self.assertTrue(any("numeric" in error for error in errors))
+
     def test_vc_relax_is_default_unless_user_opts_out(self):
         bands = [{"title": "SCF", "task": "scf"}, {"title": "Bands", "task": "bands"}]
         default = _apply_default_vasp_relaxation("calculate Si bands", bands)

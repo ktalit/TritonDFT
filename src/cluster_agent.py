@@ -144,8 +144,6 @@ def _load_user_cluster_config(path: str) -> Dict[str, Any]:
         "CLUSTER_AGENT_USER_ID": profile.get("user_id", ""),
         "CLUSTER_AGENT_SSH_TARGET": profile.get("ssh_alias", ""),
         "CLUSTER_AGENT_REMOTE_ROOT": profile.get("remote_working_directory", ""),
-        "CLUSTER_AGENT_MODEL": defaults.get("model", ""),
-        "CLUSTER_AGENT_BACKEND": defaults.get("backend", ""),
         "CLUSTER_AGENT_WORK_DIR": defaults.get("work_dir", ""),
         "CLUSTER_AGENT_POLL_SECONDS": defaults.get("poll_seconds", ""),
         "TRITONDFT_QE_SLURM_TEMPLATE": profile.get("qe_slurm_script", ""),
@@ -162,7 +160,7 @@ def _load_user_cluster_config(path: str) -> Dict[str, Any]:
     }
     user_id = str(profile.get("user_id", "")).strip()
     hostname = str(profile.get("hostname", "")).strip()
-    if user_id and hostname:
+    if not str(profile.get("ssh_alias", "")).strip() and user_id and hostname:
         values["CLUSTER_AGENT_SSH_TARGET"] = f"{user_id}@{hostname}"
     result = {key: str(value).strip() for key, value in values.items() if value not in (None, "")}
     if "openai" in api_keys:
@@ -179,6 +177,24 @@ def _load_user_cluster_config_into_environment(path: str) -> Dict[str, str]:
     return values
 
 
+def _validate_user_cluster_config(path: str, values: Dict[str, str]) -> None:
+    config_path = Path(path).expanduser()
+    required = {
+        "CLUSTER_AGENT_USER_ID": "clusters.<active_cluster>.user_id",
+        "CLUSTER_AGENT_REMOTE_ROOT": "clusters.<active_cluster>.remote_working_directory",
+    }
+    missing = [name for name in required if not values.get(name, "").strip()]
+    target = values.get("CLUSTER_AGENT_SSH_TARGET", "").strip()
+    if not target:
+        missing.append("hostname")
+    if missing:
+        fields = [required.get(name, "clusters.<active_cluster>.hostname") for name in missing]
+        raise ValueError(f"Complete {config_path}; missing: {', '.join(fields)}")
+    for placeholder in ("your_cluster_user", "login.example.edu", "your_user"):
+        if placeholder in target or placeholder in values.get("CLUSTER_AGENT_REMOTE_ROOT", ""):
+            raise ValueError(f"Replace the placeholder '{placeholder}' in {config_path}.")
+
+
 def _create_user_config(path: str) -> None:
     config_path = Path(path).expanduser()
     if config_path.exists():
@@ -192,8 +208,6 @@ def _create_user_config(path: str) -> None:
         "  openai: \"\"\n"
         "  materials_project: \"\"\n"
         "defaults:\n"
-        "  model: gpt-4o\n"
-        "  backend: openai\n"
         "  work_dir: tmp\n"
         "  poll_seconds: 30\n"
         "  dft_code: qe\n"
@@ -4253,11 +4267,6 @@ def interactive_main() -> None:
         help="Optional administrator defaults loaded before the user's env file",
     )
     env_parser.add_argument(
-        "--env-file",
-        default=os.environ.get("CLUSTER_AGENT_ENV_FILE", DEFAULT_USER_ENV_FILE),
-        help="Local env file with cluster-agent defaults and API keys",
-    )
-    env_parser.add_argument(
         "--config-file",
         default=os.environ.get("CLUSTER_AGENT_CONFIG_FILE", DEFAULT_USER_CONFIG_FILE),
         help="Private home-directory YAML file containing cluster profiles and user settings",
@@ -4266,29 +4275,15 @@ def interactive_main() -> None:
     user_config_exists = Path(env_args.config_file).expanduser().exists()
     if "-h" not in remaining_args and "--help" not in remaining_args:
         _create_user_config(env_args.config_file)
-        _initialize_user_config(env_args.env_file)
     _load_env_file(".env")
     _load_env_file(env_args.admin_env_file, override=True)
-    _load_env_file(env_args.env_file, override=True)
-    _load_user_cluster_config_into_environment(env_args.config_file)
+    user_config_values = _load_user_cluster_config_into_environment(env_args.config_file)
     locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
 
     if "-h" not in remaining_args and "--help" not in remaining_args:
         print(WELCOME_BANNER, flush=True)
-        if _env_missing_cluster_setup(env_args.env_file, include_environment=True):
-            if user_config_exists or not Path(env_args.env_file).expanduser().exists():
-                raise ValueError(
-                    f"Complete the selected cluster profile in {Path(env_args.config_file).expanduser()} "
-                    "(user_id, hostname, and remote_working_directory are required)."
-                )
-            _run_super_user_setup(env_args.env_file)
-            _load_env_file(env_args.env_file, override=True)
-
-        _ensure_env_defaults(env_args.env_file)
-        _load_env_file(env_args.env_file, override=True)
-        locked_provider = _apply_locked_admin_provider(env_args.admin_env_file)
-
-        if _env_missing_api_keys(env_args.env_file, include_environment=True):
+        _validate_user_cluster_config(env_args.config_file, user_config_values)
+        if not os.environ.get("OPENAI_API_KEY") or not os.environ.get("MP_API_KEY"):
             raise ValueError(
                 f"Set api_keys.openai and api_keys.materials_project in "
                 f"{Path(env_args.config_file).expanduser()} or provide administrator-managed keys."
@@ -4296,7 +4291,6 @@ def interactive_main() -> None:
 
     parser = argparse.ArgumentParser(description="Interactive local-to-Slurm DFT cluster agent")
     parser.add_argument("--admin-env-file", default=env_args.admin_env_file, help="Optional administrator defaults env file")
-    parser.add_argument("--env-file", default=env_args.env_file, help="Local env file with cluster-agent defaults and API keys")
     parser.add_argument("--config-file", default=env_args.config_file, help="Private YAML cluster profile file")
     parser.add_argument(
         "--ssh-target",
@@ -4677,7 +4671,7 @@ def interactive_main() -> None:
                         saved_run_dir = state.run_dir
                         print(
                             f"[cluster-agent] checkpoint saved. Resume with: "
-                            f"bash scripts/run_cluster_agent.sh --env-file {args.env_file} "
+                            f"bash scripts/run_cluster_agent.sh --config-file {args.config_file} "
                             f"--resume {state.run_dir}"
                         )
                 except Exception:

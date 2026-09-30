@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import types
+from cluster_agent import _load_user_cluster_config
 from unittest.mock import patch
 
 if "mp_api.client" not in sys.modules:
@@ -1279,6 +1280,19 @@ class ApprovalWorkflowTests(unittest.TestCase):
                 agent.select_pseudo_dir("bulk MoS2 bands", required, target_scope="baseline"),
                 "/pseudo/PBE",
             )
+
+    def test_explicit_soc_step_uses_fr_library_when_assessment_omits_soc(self):
+        agent = object.__new__(DFTAgent)
+        agent.pseudo_dirs = types.SimpleNamespace(
+            PBE="/pseudo/PBE", PBE_FR="/pseudo/PBE_FR",
+            PBESOL="/pseudo/PBESOL", PBESOL_FR="/pseudo/PBESOL_FR",
+            LDA="/pseudo/LDA",
+        )
+        assessment = {"parameter_guesses": {"ecutwfc": 80}}
+        self.assertEqual(
+            agent.select_pseudo_dir("Te band structure with spin-orbit coupling", assessment),
+            "/pseudo/PBE_FR",
+        )
 
     def test_fresh_phonon_branch_forces_recover_false(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -135,6 +135,19 @@ def _bands_data(run_dir: Path):
     return (paths[0], bands) if bands else None
 
 
+def _vasp_band_plot_image(run_dir: Path) -> Path | None:
+    """Find a pre-rendered VASP band plot inside a workflow."""
+    paths = sorted(
+        (path for path in run_dir.rglob("vasp_band_structure.png") if path.is_file()),
+        key=lambda path: (
+            "attempts" not in {part.lower() for part in path.parts},
+            "bands" not in str(path.parent).lower(),
+            str(path),
+        ),
+    )
+    return paths[0] if paths else None
+
+
 def _band_symmetry_ticks(run_dir: Path) -> list[tuple[float, str]]:
     """Return verified bands.x path coordinates paired with saved labels."""
     labels_path = run_dir / "band_path_labels.json"
@@ -435,6 +448,17 @@ class PlotPanel(ttk.Frame):
             _pdos_data(self.run_dir) if self.kind == "pdos" else
             _dos_data(self.run_dir)
         )
+        vasp_band_image = _vasp_band_plot_image(self.run_dir) if self.kind == "bands" else None
+        if not source and vasp_band_image is not None:
+            from matplotlib.image import imread
+            self.axes.clear()
+            self.axes.imshow(imread(vasp_band_image))
+            self.axes.set_axis_off()
+            self.figure.tight_layout(pad=0)
+            self.canvas.draw_idle()
+            self.loaded_path = str(vasp_band_image)
+            self.note.configure(text=f"VASP band structure; source: {vasp_band_image.relative_to(self.run_dir)}")
+            return
         if not source:
             missing = {
                 "bands": "No downloaded band data found.",
@@ -510,6 +534,12 @@ class PlotPanel(ttk.Frame):
             _pdos_data(self.run_dir) if self.kind == "pdos" else
             _dos_data(self.run_dir)
         )
+        if not source and self.kind == "bands":
+            image_path = _vasp_band_plot_image(self.run_dir)
+            signature = str(image_path) if image_path else ""
+            if image_path and signature != self.loaded_path:
+                self.draw()
+            return
         signature = "|".join(str(item) for item in source[0]) if source and self.kind == "pdos" else str(source[0]) if source else ""
         if source and signature != self.loaded_path:
             self.draw()

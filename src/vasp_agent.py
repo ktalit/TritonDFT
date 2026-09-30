@@ -266,6 +266,10 @@ VASP facts to obey:
 - The POSCAR species order must be the same order used to concatenate POTCAR.
 - INCAR is tag = value format. Use VASP tags, not Quantum ESPRESSO namelists.
 - KPOINTS controls the k-point sampling.
+- For a bands step, use valid VASP Line-mode KPOINTS. Coordinate rows contain
+  exactly three coordinates followed by ``! label`` (never a fourth numeric
+  weight). Write every path segment as an endpoint pair separated by a blank
+  line; a connected Gamma-X-M path must repeat X as ``Gamma,X`` then ``X,M``.
 - POTCAR is proprietary and will be assembled by TritonDFT from the user's licensed potential tree. Do not output POTCAR content.
 - Use ENCUT in eV. If you do not know the exact POTCAR ENMAX values, set a conservative placeholder ENCUT.
 - Use VASP-appropriate tags such as SYSTEM, ENCUT, EDIFF, ISMEAR, SIGMA, IBRION, NSW, ISIF, EDIFFG, LCHARG, LWAVE, NELM, LORBIT, ICHARG, NBANDS, KPAR, NCORE only when relevant.
@@ -689,6 +693,61 @@ done
     return str(destination)
 
 
+def _band_kpoints_validation_errors(text: str) -> List[str]:
+    """Validate the explicit endpoint-pair syntax required by VASP Line-mode."""
+    errors: List[str] = []
+    lines = text.splitlines()
+    if len(lines) < 6:
+        return ["Band KPOINTS is incomplete"]
+    try:
+        points_per_segment = int(lines[1].strip())
+        if points_per_segment < 2:
+            raise ValueError
+    except ValueError:
+        errors.append("Band KPOINTS line 2 must be an integer of at least 2 points per segment")
+    if not lines[2].strip().lower().startswith("l"):
+        errors.append("Band KPOINTS line 3 must specify Line-mode")
+    if not lines[3].strip().lower().startswith(("r", "c", "k")):
+        errors.append("Band KPOINTS line 4 must specify reciprocal or Cartesian coordinates")
+
+    segments: List[List[str]] = []
+    current: List[str] = []
+    for raw in lines[4:]:
+        if raw.strip():
+            current.append(raw)
+        elif current:
+            segments.append(current)
+            current = []
+    if current:
+        segments.append(current)
+    if not segments:
+        errors.append("Band KPOINTS does not contain any path segments")
+        return errors
+    if any(len(segment) != 2 for segment in segments):
+        errors.append(
+            "Each Line-mode path segment must contain exactly two endpoint rows, "
+            "with segments separated by a blank line"
+        )
+    for segment in segments:
+        for raw in segment:
+            coordinate_text, separator, label = raw.partition("!")
+            fields = coordinate_text.split()
+            if len(fields) != 3:
+                errors.append(
+                    "Line-mode endpoint rows must contain exactly three coordinates before '! label'"
+                )
+                return errors
+            try:
+                [float(value) for value in fields]
+            except ValueError:
+                errors.append("Line-mode endpoint coordinates must be numeric")
+                return errors
+            if not separator or not label.strip():
+                errors.append("Each Line-mode endpoint must include a non-empty '! label'")
+                return errors
+    return errors
+
+
 def _validation_errors(input_set: VASPInputSet) -> List[str]:
     errors: List[str] = []
     required = ["POSCAR", "INCAR", "KPOINTS"]
@@ -715,6 +774,11 @@ def _validation_errors(input_set: VASPInputSet) -> List[str]:
                 errors.append(f"INCAR appears to contain Quantum ESPRESSO syntax: {bad}")
         if not re.search(r"(?mi)^\s*ENCUT\s*=", incar_text):
             errors.append("INCAR is missing ENCUT")
+    kpoints = input_set.directory / "KPOINTS"
+    if kpoints.exists() and _vasp_task_kind(input_set.task) == "bands":
+        errors.extend(_band_kpoints_validation_errors(
+            kpoints.read_text(encoding="utf-8", errors="replace")
+        ))
     return errors
 
 

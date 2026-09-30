@@ -1,0 +1,45 @@
+# Copy this file to ~/.tritondft/config.yaml on the TritonDFT host.
+# Replace the example username, hostname, alias, and paths with your own.
+# Never include SSH private-key contents in this file.
+active_cluster: my_cluster
+
+api_keys:
+  # Leave empty when your administrator supplies and locks provider keys.
+  openai: ""
+  materials_project: ""
+
+defaults:
+  # Model and backend are supplied by the administrator.
+  work_dir: tmp
+  poll_seconds: 30
+  # Use "qe" or "vasp" to select automatically.
+  # Leave empty to choose interactively at startup (not to run both).
+  dft_code: ""
+  # Configure the actual SSH key in ~/.ssh/config or your SSH agent.
+  # This is an authentication method, not a key filename.
+  ssh_authentication: public_key
+
+clusters:
+  my_cluster:
+    # Your account on the remote compute cluster.
+    user_id: your_compute_cluster_username
+    hostname: login.your-cluster.example
+    # Leave empty unless this alias exists in your own ~/.ssh/config.
+    ssh_alias: ""
+    remote_working_directory: /path/to/your/writable/remote/tritondft_runs
+
+    # Local Slurm template on the TritonDFT host; edit for your cluster.
+    qe_slurm_script: ~/.tritondft/slurm/my-cluster-qe.sh
+    # Optional directory containing QE executables on the compute cluster.
+    remote_qe_bin_dir: ""
+
+    # VASP requires your own valid license and authorized cluster access.
+    vasp_slurm_script: ~/.tritondft/slurm/my-cluster-vasp.sh
+    remote_vasp_command: ""
+    # Licensed potential library on the compute cluster, not the local host.
+    # Example layout: <root>/PBE/Si/POTCAR
+    remote_vasp_potcar_root: /path/to/authorized/VASP_PP
+    vasp_functional: ""
+
+# After personalizing this file, protect it with:
+# chmod 600 ~/.tritondft/config.yaml

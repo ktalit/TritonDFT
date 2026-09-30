@@ -316,6 +316,7 @@ def session_snapshot(store: DashboardStore, token: str) -> dict[str, Any]:
         (item for item in reversed(activity) if item.get("state") in {"waiting_terminal", "success", "error"}),
         None,
     )
+    safe_files = _safe_files(root)
     return {
         "session_id": session["session_id"],
         "owner": session["owner"],
@@ -330,7 +331,8 @@ def session_snapshot(store: DashboardStore, token: str) -> dict[str, Any]:
         "validation": (root / "validation_report.txt").read_text(encoding="utf-8", errors="replace") if (root / "validation_report.txt").is_file() else "No validation report yet.",
         "structure": structure,
         "capabilities": capabilities,
-        "files": _safe_files(root),
+        "files": safe_files,
+        "images": [item for item in safe_files if not item["text"]],
         "approval": approval,
         "activity": activity,
         "terminal_required": bool(terminal_required and terminal_required.get("state") == "waiting_terminal"),
@@ -387,12 +389,56 @@ def render_workflow_plot(root: Path, kind: str, options: dict[str, Any], output_
     reference = electronic_reference(root, reference_name.lower())
     if kind == "bands":
         source = _bands_data(root)
-        if not source: raise FileNotFoundError("No downloaded band data found")
-        _path, bands = source
-        for band in bands:
-            axes.plot([p[0] for p in band], [p[1] - reference for p in band], color="black", lw=.9)
+        if source:
+            _path, bands = source
+            for band in bands:
+                axes.plot([p[0] for p in band], [p[1] - reference for p in band], color="black", lw=.9)
+            ticks = _band_symmetry_ticks(root)
+        else:
+            # VASP workflows store their band eigenvalues in vasprun.xml rather
+            # than QE's .band.gnu format. Prefer a line-mode/bands attempt.
+            from vasp_plotter import _label_ticks, _load_vasprun
+            candidates = sorted(
+                root.rglob("vasprun.xml"),
+                key=lambda path: (
+                    "bands" not in str(path.parent).lower(),
+                    not (path.parent / "KPOINTS").is_file(),
+                    str(path),
+                ),
+            )
+            band_structure = None
+            for candidate in candidates:
+                try:
+                    candidate_bands = _load_vasprun(candidate).get_band_structure(line_mode=True)
+                    if getattr(candidate_bands, "branches", None):
+                        band_structure = candidate_bands
+                        break
+                except Exception:
+                    continue
+            if band_structure is None:
+                raise FileNotFoundError("No downloaded QE or VASP line-mode band data found")
+            mode = reference_name.lower()
+            if mode == "fermi":
+                reference = float(band_structure.efermi)
+            elif mode == "vbm":
+                reference = float(band_structure.get_vbm()["energy"])
+            elif mode == "midgap":
+                reference = (
+                    float(band_structure.get_vbm()["energy"])
+                    + float(band_structure.get_cbm()["energy"])
+                ) / 2.0
+            else:
+                reference = 0.0
+            for energies in band_structure.bands.values():
+                for band in energies:
+                    axes.plot(
+                        band_structure.distance,
+                        [float(energy) - reference for energy in band],
+                        color="black", lw=.9,
+                    )
+            positions, labels = _label_ticks(band_structure)
+            ticks = list(zip(positions, labels))
         axes.axhline(0, color="tab:red", ls="--", lw=.8)
-        ticks = _band_symmetry_ticks(root)
         if ticks:
             positions, labels = zip(*ticks); axes.set_xticks(positions); axes.set_xticklabels(labels)
             for position in positions: axes.axvline(position, color=".75", lw=.6)
@@ -444,7 +490,7 @@ PAGE = r"""<!doctype html>
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>TritonDFT experimental dashboard</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:0;background:#f3f6fa;color:#172033}header{background:#17365d;color:white;padding:18px 24px}main{padding:18px;max-width:1200px;margin:auto}.card{background:white;border:1px solid #d7deea;border-radius:8px;padding:14px;margin-bottom:14px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #dde3ec;padding:7px;text-align:left}textarea{box-sizing:border-box;width:100%;min-height:360px;font-family:ui-monospace,monospace}button{padding:8px 12px;margin:4px;background:#2563eb;color:white;border:0;border-radius:5px}button:disabled{opacity:.5}button.danger{background:#b91c1c}button.secondary{background:#53657d}.tabs button{background:#e5eaf2;color:#172033}.muted{color:#667085}.error{color:#b91c1c;white-space:pre-wrap}.ok{color:#067647}.terminal-banner{background:#fff4ce;border:2px solid #d97706;color:#7c2d12}.activity{max-height:360px;overflow:auto;background:#101828;color:#e4e7ec;padding:12px;font-family:ui-monospace,monospace}.activity-line{padding:4px 0;border-bottom:1px solid #344054}pre{white-space:pre-wrap;overflow:auto}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:800px){.grid{grid-template-columns:1fr}}</style>
+body{font-family:system-ui,sans-serif;margin:0;background:#f3f6fa;color:#172033}header{background:#17365d;color:white;padding:18px 24px}main{padding:18px;max-width:1200px;margin:auto}.card{background:white;border:1px solid #d7deea;border-radius:8px;padding:14px;margin-bottom:14px}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #dde3ec;padding:7px;text-align:left}textarea{box-sizing:border-box;width:100%;min-height:360px;font-family:ui-monospace,monospace}button{padding:8px 12px;margin:4px;background:#2563eb;color:white;border:0;border-radius:5px}button:disabled{opacity:.5}button.danger{background:#b91c1c}button.secondary{background:#53657d}.tabs button{background:#e5eaf2;color:#172033}.muted{color:#667085}.error{color:#b91c1c;white-space:pre-wrap}.ok{color:#067647}.terminal-banner{background:#fff4ce;border:2px solid #d97706;color:#7c2d12}.activity{max-height:360px;overflow:auto;background:#101828;color:#e4e7ec;padding:12px;font-family:ui-monospace,monospace}.activity-line{padding:4px 0;border-bottom:1px solid #344054}pre{white-space:pre-wrap;overflow:auto}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.plot-gallery img{display:block;max-width:100%;max-height:760px;margin:8px auto}.plot-gallery figure{margin:0 0 18px}.plot-gallery figcaption{overflow-wrap:anywhere;color:#667085}@media(max-width:800px){.grid{grid-template-columns:1fr}}</style>
 </head><body><header><h1>TritonDFT experimental browser dashboard</h1><div id='identity'></div></header><main>
 <div class='card'><b>Connection:</b> <span id='connection'>connecting</span> · <b>Status:</b> <span id='status'>preparing</span> · <b>Last updated:</b> <span id='last-updated'>waiting</span> · <span id='next-refresh'>refresh in 15s</span><div class='muted'>Closing this tab does not cancel an HPC calculation.</div></div>
 <div id='terminal-banner' class='card terminal-banner' style='display:none'><h2>Action required in terminal</h2><div>SSH authentication is waiting for your password and/or TOTP in the terminal that started TritonDFT. Credentials cannot be entered in this dashboard.</div></div>
@@ -453,16 +499,18 @@ body{font-family:system-ui,sans-serif;margin:0;background:#f3f6fa;color:#172033}
 <div class='card'><h2>Activity</h2><div class='muted'>Read-only sanitized workflow activity. Passwords, TOTP codes, API keys, and dashboard tokens are never shown.</div><div id='activity' class='activity'>No activity recorded yet.</div></div>
 <div class='card'><h2>Structure</h2><button onclick='openVesta()'>Open in VESTA</button><button class='secondary' onclick='locateVesta()'>Locate VESTA…</button><button class='secondary' onclick="window.open('https://jp-minerals.org/vesta/en/download.html','_blank','noopener')">Download VESTA</button><button class='secondary' onclick="location.href='/api/s/'+token+'/structure.cif'">Save CIF As…</button><button class='secondary' onclick='openStructureFolder()'>Open folder</button><div id='structure-result' class='muted'></div><pre id='structure'></pre></div>
 <div id='file-card' class='card'><h2>Input and result files</h2><select id='files'></select><button onclick='openFile()'>Open</button><span id='file-note' class='muted'></span><textarea id='editor' readonly></textarea><button id='save' style='display:none' onclick='saveFile()'>Save explicitly</button><div id='save-result'></div></div>
+<div id='generated-plots-card' class='card' style='display:none'><h2>Generated plots</h2><div id='generated-plots' class='plot-gallery'></div></div>
 <div class='card'><h2>Interactive result plots</h2><select id='plot-kind'></select> <label>X min <input id='xmin' size='6'></label> <label>X max <input id='xmax' size='6'></label> <label>Y min <input id='ymin' size='6'></label> <label>Y max <input id='ymax' size='6'></label> <label>Reference <select id='reference'><option>VBM</option><option>Fermi</option><option>Midgap</option><option>Absolute</option></select></label> <label>Raman FWHM <input id='fwhm' size='5' value='8'></label><br><button onclick='showPlot()'>Apply</button><button class='secondary' onclick='resetPlot()'>Reset</button><button class='secondary' onclick="downloadPlot('png')">Save PNG</button><button class='secondary' onclick="downloadPlot('pdf')">Save PDF</button><div id='plot-error' class='error'></div><div><img id='plot' style='max-width:100%'></div></div>
 <div class='card'><h2>Ask Results</h2><div class='muted'>Searches only this workflow. Relevant excerpts may be sent to your configured LLM provider.</div><input id='question' style='width:65%;padding:8px' placeholder='Question about these calculated files'> <select id='question-scope'><option value='false'>Completed results</option><option value='true'>Include failed attempts</option></select> <label><input id='consent' type='checkbox'> I consent to sending relevant excerpts</label><button onclick='askResults()'>Ask</button><div id='question-status' class='muted'></div><pre id='answer'></pre></div>
 <div class='card'><h2>Send a session message</h2><input id='message' style='width:70%;padding:8px' placeholder='Message for the terminal session'><button onclick='sendMessage()'>Send</button><span id='message-result'></span></div>
 </main><script>
 const token=location.pathname.split('/').pop();let snapshot=null,currentFile=null,currentHash='';const reviewedInputs=new Set();
 async function api(path,opt){const r=await fetch('/api/s/'+token+path,opt);if(!r.ok)throw new Error(await r.text());return r.headers.get('content-type')?.includes('json')?r.json():r.text()}
-function render(s){snapshot=s;document.getElementById('identity').textContent='Session '+s.session_id+' · '+s.workflow;document.getElementById('status').textContent=s.status;document.getElementById('last-updated').textContent=new Date().toLocaleTimeString();document.getElementById('terminal-banner').style.display=s.terminal_required?'block':'none';const activity=document.getElementById('activity'),wasAtBottom=activity.scrollHeight-activity.scrollTop-activity.clientHeight<30;activity.innerHTML=(s.activity||[]).length?(s.activity||[]).map(x=>`<div class='activity-line'><span class='muted'>${new Date(x.timestamp*1000).toLocaleTimeString()}</span> ${escapeHtml(x.event)}${x.detail?' — '+escapeHtml(x.detail):''}</div>`).join(''):'No activity recorded yet.';if(wasAtBottom)activity.scrollTop=activity.scrollHeight;document.getElementById('validation').textContent=s.validation;document.getElementById('structure').textContent=s.structure||'';document.getElementById('steps').innerHTML=(s.steps||[]).map(x=>`<tr><td>${x.id??''}</td><td>${escapeHtml(x.problem||x.tool||'')}</td><td>${escapeHtml(x.branch||'')}</td><td>${escapeHtml(x.status||'')}</td><td>${escapeHtml((x.job_ids||[]).join(', '))}</td></tr>`).join('');const select=document.getElementById('files'),old=select.value;select.innerHTML=(s.files||[]).map(f=>`<option value='${f.id}'>${escapeHtml(f.path)}</option>`).join('');if([...select.options].some(o=>o.value===old))select.value=old;const kind=document.getElementById('plot-kind'),oldKind=kind.value;kind.innerHTML=(s.capabilities||[]).filter(x=>['bands','dos','pdos','phonons','raman'].includes(x)).map(x=>`<option value='${x}'>${x.toUpperCase()}</option>`).join('');if([...kind.options].some(o=>o.value===oldKind))kind.value=oldKind;const box=document.getElementById('approval');box.style.display=s.approval?'block':'none';if(s.approval){const errors=s.approval.validation_errors||[];document.getElementById('approval-errors').textContent=errors.length?'Approval blocked by validation:\n'+errors.join('\n'):'';if(errors.length)document.getElementById('approval-result').textContent='Correct the listed input problem, then approve again.';document.getElementById('approval-plan').textContent=s.approval.plan||'';renderApprovalInputs(s);const d=s.approval.structure_defaults||{},mp=d.materials_project_available!==false;document.getElementById('approval-extra').innerHTML=s.approval.review_stage==='plan'?"<label>Maximum nodes <input id='nodes' type='number' min='1' value='"+(s.approval.resource_defaults?.max_nodes||1)+"'></label> <label>Cores per node <input id='cores' type='number' min='1' value='"+(s.approval.resource_defaults?.cores_per_node||1)+"'></label><br><label>Structure source <select id='structure-source'>"+(mp?"<option value='materials_project'>Materials Project</option>":"")+"<option value='file'>Workflow-local structure file</option></select></label> <input id='structure-path' placeholder='path inside this workflow directory'>":''}}
+function renderGeneratedPlots(s){const images=s.images||[],card=document.getElementById('generated-plots-card'),gallery=document.getElementById('generated-plots');card.style.display=images.length?'block':'none';gallery.innerHTML=images.map(item=>`<figure><img src="/api/s/${token}/image/${item.id}" alt="${escapeHtml(item.name)}"><figcaption>${escapeHtml(item.path)}</figcaption></figure>`).join('')}
+function render(s){snapshot=s;document.getElementById('identity').textContent='Session '+s.session_id+' · '+s.workflow;document.getElementById('status').textContent=s.status;document.getElementById('last-updated').textContent=new Date().toLocaleTimeString();document.getElementById('terminal-banner').style.display=s.terminal_required?'block':'none';const activity=document.getElementById('activity'),wasAtBottom=activity.scrollHeight-activity.scrollTop-activity.clientHeight<30;activity.innerHTML=(s.activity||[]).length?(s.activity||[]).map(x=>`<div class='activity-line'><span class='muted'>${new Date(x.timestamp*1000).toLocaleTimeString()}</span> ${escapeHtml(x.event)}${x.detail?' — '+escapeHtml(x.detail):''}</div>`).join(''):'No activity recorded yet.';if(wasAtBottom)activity.scrollTop=activity.scrollHeight;document.getElementById('validation').textContent=s.validation;document.getElementById('structure').textContent=s.structure||'';document.getElementById('steps').innerHTML=(s.steps||[]).map(x=>`<tr><td>${x.id??''}</td><td>${escapeHtml(x.problem||x.tool||'')}</td><td>${escapeHtml(x.branch||'')}</td><td>${escapeHtml(x.status||'')}</td><td>${escapeHtml((x.job_ids||[]).join(', '))}</td></tr>`).join('');const select=document.getElementById('files'),old=select.value;select.innerHTML=(s.files||[]).map(f=>`<option value='${f.id}'>${escapeHtml(f.path)}</option>`).join('');if([...select.options].some(o=>o.value===old))select.value=old;const kind=document.getElementById('plot-kind'),oldKind=kind.value;kind.innerHTML=(s.capabilities||[]).filter(x=>['bands','dos','pdos','phonons','raman'].includes(x)).map(x=>`<option value='${x}'>${x.toUpperCase()}</option>`).join('');if([...kind.options].some(o=>o.value===oldKind))kind.value=oldKind;if(kind.value&&!document.getElementById('plot').src)showPlot();const box=document.getElementById('approval');box.style.display=s.approval?'block':'none';if(s.approval){const errors=s.approval.validation_errors||[];document.getElementById('approval-errors').textContent=errors.length?'Approval blocked by validation:\n'+errors.join('\n'):'';if(errors.length)document.getElementById('approval-result').textContent='Correct the listed input problem, then approve again.';document.getElementById('approval-plan').textContent=s.approval.plan||'';renderApprovalInputs(s);const d=s.approval.structure_defaults||{},mp=d.materials_project_available!==false;document.getElementById('approval-extra').innerHTML=s.approval.review_stage==='plan'?"<label>Maximum nodes <input id='nodes' type='number' min='1' value='"+(s.approval.resource_defaults?.max_nodes||1)+"'></label> <label>Cores per node <input id='cores' type='number' min='1' value='"+(s.approval.resource_defaults?.cores_per_node||1)+"'></label><br><label>Structure source <select id='structure-source'>"+(mp?"<option value='materials_project'>Materials Project</option>":"")+"<option value='file'>Workflow-local structure file</option></select></label> <input id='structure-path' placeholder='path inside this workflow directory'>":''}}
 function renderApprovalInputs(s){const paths=s.approval.editable_files||[],files=s.files||[],target=document.getElementById('approval-inputs'),approve=document.getElementById('approve-button');if(!paths.length){target.innerHTML=s.approval.review_stage==='inputs'?"<div class='error'>No editable generated inputs were supplied. Do not approve.</div>":'';approve.disabled=s.approval.review_stage==='inputs';return}const rows=paths.map(path=>{const file=files.find(f=>f.path===path),seen=file&&reviewedInputs.has(file.id);return file?`<button class='${seen?'secondary':''}' onclick="reviewApprovalFile('${file.id}')">${seen?'Reviewed':'Review input'}: ${escapeHtml(path)}</button>`:`<div class='error'>Missing generated input: ${escapeHtml(path)}</div>`}).join('');target.innerHTML=`<h3>Generated inputs (${paths.length})</h3><div class='muted'>Open every input before approval. Editable files can be saved explicitly below.</div>${rows}`;approve.disabled=paths.some(path=>{const file=files.find(f=>f.path===path);return !file||!reviewedInputs.has(file.id)})}
 function escapeHtml(v){return String(v).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
-async function refresh(){try{render(await api(''));document.getElementById('connection').textContent='connected'}catch(e){document.getElementById('connection').textContent='unavailable'}}
+async function refresh(){try{const s=await api('');render(s);renderGeneratedPlots(s);document.getElementById('connection').textContent='connected'}catch(e){document.getElementById('connection').textContent='unavailable'}}
 async function openFile(){const id=document.getElementById('files').value;if(!id)return;const d=await api('/file/'+id);currentFile=id;currentHash=d.sha256;document.getElementById('editor').value=d.content;document.getElementById('editor').readOnly=!d.editable;document.getElementById('save').style.display=d.editable?'inline-block':'none';document.getElementById('file-note').textContent=d.editable?'Editable approval draft':'Read-only evidence'}
 async function reviewApprovalFile(id){document.getElementById('files').value=id;await openFile();reviewedInputs.add(id);renderApprovalInputs(snapshot);document.getElementById('file-card').scrollIntoView({behavior:'smooth',block:'start'})}
 async function saveFile(){try{const d=await api('/file/'+currentFile,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({content:document.getElementById('editor').value,expected_sha256:currentHash})});currentHash=d.sha256;document.getElementById('save-result').textContent='Saved explicitly'}catch(e){document.getElementById('save-result').textContent=e}}
@@ -479,7 +527,7 @@ function downloadPlot(format){location.href=plotUrl(format,true)}
 async function askResults(){document.getElementById('question-status').textContent='Searching workflow evidence…';document.getElementById('answer').textContent='Working…';try{const d=await api('/questions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({question:document.getElementById('question').value,include_failed:questionScope(),consent:document.getElementById('consent').checked})});pollQuestion(d.question_id)}catch(e){document.getElementById('question-status').textContent=e;document.getElementById('answer').textContent=''}}
 function questionScope(){return document.getElementById('question-scope').value==='true'}
 async function pollQuestion(id){const d=await api('/questions/'+id);if(d.status==='working'){setTimeout(()=>pollQuestion(id),1000);return}document.getElementById('question-status').textContent=d.detail||d.status;document.getElementById('answer').textContent=d.answer||''}
-let refreshRemaining=15;setInterval(()=>{refreshRemaining--;if(refreshRemaining<=0){refreshRemaining=15;refresh()}document.getElementById('next-refresh').textContent='refresh in '+refreshRemaining+'s'},1000);const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+token);ws.onopen=()=>document.getElementById('connection').textContent='live';ws.onmessage=e=>{render(JSON.parse(e.data));refreshRemaining=15};ws.onerror=()=>document.getElementById('connection').textContent='15-second polling';ws.onclose=()=>document.getElementById('connection').textContent='15-second polling';refresh();
+let refreshRemaining=15;setInterval(()=>{refreshRemaining--;if(refreshRemaining<=0){refreshRemaining=15;refresh()}document.getElementById('next-refresh').textContent='refresh in '+refreshRemaining+'s'},1000);const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/'+token);ws.onopen=()=>document.getElementById('connection').textContent='live';ws.onmessage=e=>{const s=JSON.parse(e.data);render(s);renderGeneratedPlots(s);refreshRemaining=15};ws.onerror=()=>document.getElementById('connection').textContent='15-second polling';ws.onclose=()=>document.getElementById('connection').textContent='15-second polling';refresh();
 </script></body></html>"""
 
 

@@ -9,8 +9,8 @@ api_keys:
   materials_project: ""
 
 defaults:
-  model: gpt-4o
-  backend: openai
+  # Model and backend are administrator-controlled. Do not set them here.
+  # The agent reads them from the administrator configuration.
   work_dir: tmp
   poll_seconds: 30
   # Use qe, vasp, or both. Only the selected code's settings are required.

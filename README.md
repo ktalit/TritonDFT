@@ -151,6 +151,31 @@ options from overriding the administrator's API keys, backend, and model. See
 `CLUSTER_INSTALL.md`; never commit the populated administrator file.
 Type `exit` or `quit` at the `DFT request>` prompt to stop the loop.
 
+### Standalone VASP plotting agent
+
+Completed VASP runs can be plotted without rerunning the calculation or using
+an LLM. The plotter reads `vasprun.xml` and can generate total bands,
+element-projected bands, total DOS, and projected DOS:
+
+```bash
+python scripts/plot_vasp.py /path/to/vasp/run --plot all
+```
+
+Plots are written to `/path/to/vasp/run/plots/` by default. Examples:
+
+```bash
+python scripts/plot_vasp.py /path/to/vasp/run --plot bands
+python scripts/plot_vasp.py /path/to/vasp/run --plot projected-bands --element Si
+python scripts/plot_vasp.py /path/to/vasp/run --plot projected-bands --element Si --orbital d
+python scripts/plot_vasp.py /path/to/vasp/run --plot dos
+python scripts/plot_vasp.py /path/to/vasp/run --plot pdos --element Si
+python scripts/plot_vasp.py /path/to/vasp/run --plot pdos --orbital d
+```
+
+The VASP calculation must have produced a `vasprun.xml` containing the
+corresponding band or DOS data. The command writes a
+`vasp_plot_manifest.json` beside the generated PNG files.
+
 ## [Optional] Deploy Backend in Dokcer
 ```
 docker run -it -v $(pwd):/workspace  \

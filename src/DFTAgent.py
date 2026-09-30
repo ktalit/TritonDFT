@@ -276,11 +276,13 @@ class DFTAgent:
     ) -> str:
         """Select an XC/SOC-compatible library from explicit request or scoped assessment."""
         text = request or ""
-        needs_soc = (
-            self._assessment_enables_soc(assessment)
-            if assessment
-            else bool(re.search(r"\bSOC\b|spin[- ]orbit", text, re.I))
-        )
+        # Explicit step/request text is authoritative even when a parameter
+        # assessment object is present.  Parameter-generation responses do not
+        # always repeat the workflow's SOC policy; treating such an object as a
+        # replacement for the text could silently select scalar UPFs for an
+        # explicitly SOC step.
+        needs_soc = bool(re.search(r"\bSOC\b|spin[- ]orbit|lspinorb", text, re.I))
+        needs_soc = needs_soc or self._assessment_enables_soc(assessment)
         if target_scope == "baseline" and isinstance(assessment, dict):
             policy = assessment.get("soc_policy") or {}
             if str(policy.get("scope", "")).lower() == "electronic_only":
@@ -845,6 +847,23 @@ User request:
             os.makedirs(work_dir, exist_ok=True)
             subproblem_id = subproblem.get("id", problem_id)
             input_paths = write_inputs(work_dir, scripts, prefix="input", suffix=".in", subproblem_id=subproblem_id)
+
+            # The generated QE input is the final authority on whether this
+            # step enables SOC.  If the model emits lspinorb even though the
+            # plan/parameter summary omitted it, promote the step to the FR
+            # library before paths and species filenames are patched.
+            if fn_spec.exec == "pw.x" and any(
+                re.search(
+                    r"(?mi)^\s*lspinorb\s*=\s*(?:\.true\.|true|t)(?=\s*[,/!]|\s*$)",
+                    Path(path).read_text(encoding="utf-8"),
+                )
+                for path in input_paths
+            ):
+                step_pseudo_dir = self.select_pseudo_dir(
+                    f"{query}\n{subproblem.get('problem', '')}\nlspinorb=.true.",
+                    extract_json_brutal(params_json),
+                    update=False,
+                )
             
             # Patch Inputs
             missing_pseudo_err: Optional[str] = None
@@ -973,7 +992,10 @@ User request:
                             f.write(str(item.get("content", "")).rstrip() + "\n\n")
                     # Re-apply path/prefix patching so QE still finds pseudos & outdir.
                     for path in input_paths:
-                        patch_qe_input_file(path, new_pseudo_dir=self.pseudo_dir, new_outdir=self.out_dir,
+                        # Preserve this step's branch-specific library.  Using
+                        # self.pseudo_dir here resets SOC branches to the
+                        # scalar-relativistic workflow baseline after approval.
+                        patch_qe_input_file(path, new_pseudo_dir=step_pseudo_dir, new_outdir=self.out_dir,
                                             new_prefix=self._run_prefix, pp_dir_clean=True,
                                             new_cutoffs=self._run_cutoffs)
 
