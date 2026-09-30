@@ -103,13 +103,21 @@ TritonDFT replaces that marker with the final `CELL_PARAMETERS` and
 approved pre-execution versions are retained under `approved_inputs/` in the
 run directory.
 
+Install the development checkout and initialize the private user configuration:
+
 ```bash
-bash scripts/run_cluster_agent.sh
+python -m pip install -e .
+tritondft init
+tritondft doctor
+tritondft
 ```
 
-On the first run for each Linux user, TritonDFT creates
-`~/.tritondft/config.yaml`. Copy the schema from
-`config/cluster_agent_config.example.yaml` and edit this one file. It contains
+Use `tritondft --version` to show the installed version. The existing
+`bash scripts/run_cluster_agent.sh` launcher remains available for source
+checkouts.
+
+`tritondft init` creates `~/.tritondft/config.yaml`, private cache/log/workflow
+directories, and editable QE/VASP Slurm templates. Edit the YAML file once. It contains
 the selected cluster, cluster user id, login hostname, remote working directory,
 QE/VASP Slurm script paths, and optional user API keys. Add more named entries
 under `clusters` for accounts on different clusters and change `active_cluster`

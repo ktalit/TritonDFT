@@ -15,6 +15,9 @@ tmp
 local/VESTA/
 downloads/VESTA-*
 outputs/
+*.egg-info/
+build/
+dist/
 
 # Secret-bearing local files — NEVER commit these.
 env_setup.sh

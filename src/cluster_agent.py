@@ -48,13 +48,14 @@ from workflow_state import AttemptCheckpoint, WorkflowCheckpoint, create_checkpo
 from workflow_context import WorkflowContext, create_workflow_context
 from dashboard_mode import BrowserDashboardSession, dashboard_mode
 from dashboard_activity import append_activity
+from user_paths import config_file, create_config, home_dir, slurm_dir
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_USER_QE_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_qe_slurm_job_file.txt")
-DEFAULT_USER_VASP_SLURM_TEMPLATE = str(PROJECT_ROOT / ".tritondft" / "example_vasp_slurm_job_file.txt")
-DEFAULT_USER_ENV_FILE = str(PROJECT_ROOT / ".tritondft" / ".env.cluster")
-DEFAULT_USER_CONFIG_FILE = "~/.tritondft/config.yaml"
+DEFAULT_USER_QE_SLURM_TEMPLATE = str(slurm_dir() / "my-cluster-qe.sh")
+DEFAULT_USER_VASP_SLURM_TEMPLATE = str(slurm_dir() / "my-cluster-vasp.sh")
+DEFAULT_USER_ENV_FILE = str(home_dir() / ".env.cluster")
+DEFAULT_USER_CONFIG_FILE = str(config_file())
 ADMIN_PROVIDER_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
@@ -197,34 +198,9 @@ def _validate_user_cluster_config(path: str, values: Dict[str, str]) -> None:
 
 def _create_user_config(path: str) -> None:
     config_path = Path(path).expanduser()
-    if config_path.exists():
-        return
-    config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    config_path.write_text(
-        "# Edit this file once for your TritonDFT cluster access.\n"
-        "# Add another entry under clusters for a different cluster.\n"
-        "active_cluster: my_cluster\n"
-        "api_keys:\n"
-        "  openai: \"\"\n"
-        "  materials_project: \"\"\n"
-        "defaults:\n"
-        "  work_dir: tmp\n"
-        "  poll_seconds: 30\n"
-        "  dft_code: qe\n"
-        "clusters:\n"
-        "  my_cluster:\n"
-        "    user_id: your_cluster_user\n"
-        "    hostname: login.example.edu\n"
-        "    remote_working_directory: /scratch/$USER/tritondft_runs\n"
-        "    ssh_alias: my_cluster\n"
-        "    qe_slurm_script: ~/.tritondft/slurm/my_cluster-qe.sh\n"
-        "    vasp_slurm_script: ~/.tritondft/slurm/my_cluster-vasp.sh\n"
-        "    remote_qe_bin_dir: \"\"\n"
-        "    remote_vasp_potcar_root: /home/your_cluster_user/VASP_PP\n",
-        encoding="utf-8",
-    )
-    config_path.chmod(0o600)
-    print(f"[cluster-agent] Created user configuration template: {config_path}")
+    destination, created = create_config(config_path)
+    if created:
+        print(f"[cluster-agent] Created user configuration template: {destination}")
 
 
 def _locked_admin_provider(path: str) -> Dict[str, str]:
@@ -4671,7 +4647,7 @@ def interactive_main() -> None:
                         saved_run_dir = state.run_dir
                         print(
                             f"[cluster-agent] checkpoint saved. Resume with: "
-                            f"bash scripts/run_cluster_agent.sh --config-file {args.config_file} "
+                            f"tritondft --config-file {args.config_file} "
                             f"--resume {state.run_dir}"
                         )
                 except Exception:

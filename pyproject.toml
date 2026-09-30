@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tritondft"
+version = "0.1.0"
+description = "Interactive local-to-cluster DFT workflow agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy==1.26.4",
+  "torch",
+  "transformers",
+  "openai",
+  "mpcontribs-client",
+  "pymatgen==2025.10.7",
+  "emmet-core==0.85.1",
+  "mp-api==0.45.13",
+  "fastapi",
+  "uvicorn",
+  "PyYAML",
+  "anthropic",
+  "google-generativeai",
+  "tiktoken",
+  "slowapi",
+  "sqlalchemy>=2.0",
+  "psycopg[binary]>=3.1",
+  "python-jose[cryptography]",
+  "pydantic[email]",
+  "resend",
+  "python-dotenv",
+]
+
+[project.scripts]
+tritondft = "tritondft_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "DFTAgent",
+  "admin",
+  "artifacts",
+  "auth",
+  "browser_dashboard",
+  "cluster_agent",
+  "config",
+  "credits",
+  "dashboard_activity",
+  "dashboard_mode",
+  "db",
+  "email_sender",
+  "errors",
+  "executor",
+  "generator",
+  "jobs",
+  "ratelimit",
+  "structure_paths",
+  "tritondft_cli",
+  "user_paths",
+  "utils",
+  "vasp_agent",
+  "vasp_plotter",
+  "worker",
+  "workflow_browser_cli",
+  "workflow_context",
+  "workflow_monitor",
+  "workflow_state",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
