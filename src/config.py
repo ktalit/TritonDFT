@@ -6,18 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from tritondft_data.pseudopotentials import PSEUDO_LIBRARY_PATHS, packaged_pseudo_dir
+
 try:
     import yaml
 except ImportError as exc:
     raise ImportError("PyYAML is required to load config.yaml; install it via `pip install pyyaml`.") from exc
 
-DEFAULT_PSEUDO_DIRS = {
-    "LDA": "PseudoDojo/SR_v0.4.1/LDA_standard",
-    "PBE": "PseudoDojo/SR_v0.4.1/PBE_standard",
-    "PBESOL": "PseudoDojo/SR_v0.4.1/PBEsol_standard",
-    "PBE_FR": "PseudoDojo/FR_v0.4/PBE_standard",
-    "PBESOL_FR": "PseudoDojo/FR_v0.4/PBEsol_standard",
-}
 DEFAULT_QE_BIN_DIR = "QuantumE/bin"
 
 
@@ -34,11 +29,11 @@ class PseudoPaths:
         if not data:
             data = {}
         return cls(
-            LDA=data.get("LDA") or data.get("lda") or DEFAULT_PSEUDO_DIRS["LDA"],
-            PBE=data.get("PBE") or data.get("pbe") or DEFAULT_PSEUDO_DIRS["PBE"],
-            PBESOL=data.get("PBESOL") or data.get("pbesol") or DEFAULT_PSEUDO_DIRS["PBESOL"],
-            PBE_FR=data.get("PBE_FR") or data.get("pbe_fr") or DEFAULT_PSEUDO_DIRS["PBE_FR"],
-            PBESOL_FR=data.get("PBESOL_FR") or data.get("pbesol_fr") or DEFAULT_PSEUDO_DIRS["PBESOL_FR"],
+            LDA=data.get("LDA") or data.get("lda") or "",
+            PBE=data.get("PBE") or data.get("pbe") or "",
+            PBESOL=data.get("PBESOL") or data.get("pbesol") or "",
+            PBE_FR=data.get("PBE_FR") or data.get("pbe_fr") or "",
+            PBESOL_FR=data.get("PBESOL_FR") or data.get("pbesol_fr") or "",
         )
 
     def as_dict(self) -> dict:
@@ -79,29 +74,26 @@ class Config:
             qe_bin_dir = None
             remote_qe_bin_dir = None
 
-        # Resolve every pseudo dir against repo_root so pw.x finds them
-        # regardless of how deeply the run's cwd is nested (e.g. when
-        # work_dir is /workspace/tmp/<date>/<run>/ — 3 levels deep).
+        # Explicit administrator/user overrides remain authoritative. Relative
+        # overrides retain their existing source-checkout behavior and resolve
+        # from the repository/application root. Unset families use packaged,
+        # read-only PseudoDojo resources instead of Python-prefix assumptions.
         pseudo = PseudoPaths.from_dict(pseudo_section)
 
-        def _resolve(p: str) -> str:
-            return str((repo_root / p).resolve()) if not Path(p).is_absolute() else p
+        def _resolve(family: str, configured: str) -> str:
+            if not configured:
+                return str(packaged_pseudo_dir(family))
+            path = Path(configured).expanduser()
+            return str((repo_root / path).resolve()) if not path.is_absolute() else str(path)
 
         resolved = {
-            "LDA": _resolve(pseudo.LDA),
-            "PBE": _resolve(pseudo.PBE),
-            "PBESOL": _resolve(pseudo.PBESOL),
-            "PBE_FR": _resolve(pseudo.PBE_FR),
-            "PBESOL_FR": _resolve(pseudo.PBESOL_FR),
+            family: _resolve(family, getattr(pseudo, family))
+            for family in PSEUDO_LIBRARY_PATHS
         }
 
         # Never cross-fallback between XC families or relativistic levels.
         # A missing same-family library must fail clearly instead of silently
         # producing a scientifically inconsistent calculation.
-        def _has_upfs(d: str) -> bool:
-            p = Path(d)
-            return p.is_dir() and any(p.glob("*.upf")) or any(p.glob("*.UPF"))
-
         pseudo = PseudoPaths(**resolved)
 
         final_qe_bin = qe_bin_dir or str((repo_root / DEFAULT_QE_BIN_DIR).resolve())
